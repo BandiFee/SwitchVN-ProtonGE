@@ -330,6 +330,33 @@ FFMPEG_aarch64-unix_CONFIGURE_ARGS := \
 	--arch=aarch64 \
 	--target-os=linux
 
+# Hardware video decoding on Tegra (Switch) runs through libenvideo, which
+# drives the NVDEC/NVJPG engines directly. It has to be present in the aarch64
+# sysroot as a pkg-config module (envideo >= 1.0.0), otherwise ffmpeg's
+# configure aborts -- build with ENVIDEO=0 to leave it out.
+#
+# These land in FFMPEG_aarch64_CONFIGURE_ARGS rather than the -unix variant
+# above because ffmpeg's configure applies options in order, and the latter is
+# passed before the --disable-everything in FFMPEG_CONFIGURE_ARGS, which would
+# drop the hwaccels again.
+ENVIDEO ?= 1
+
+FFMPEG_ENVIDEO_CONFIGURE_ARGS := \
+	--enable-envideo \
+	--enable-hwaccel=h264_envideo \
+	--enable-hwaccel=hevc_envideo \
+	--enable-hwaccel=mjpeg_envideo \
+	--enable-hwaccel=mpeg1_envideo \
+	--enable-hwaccel=mpeg2_envideo \
+	--enable-hwaccel=mpeg4_envideo \
+	--enable-hwaccel=vc1_envideo \
+	--enable-hwaccel=vp8_envideo \
+	--enable-hwaccel=vp9_envideo \
+	--enable-hwaccel=wmv3_envideo
+
+FFMPEG_aarch64_CONFIGURE_ARGS := \
+	$(if $(filter-out 0,$(ENVIDEO)),$(FFMPEG_ENVIDEO_CONFIGURE_ARGS))
+
 $(eval $(call rules-source,ffmpeg,$(SRCDIR)/ffmpeg))
 $(eval $(call rules-configure,ffmpeg,i386,unix))
 $(eval $(call rules-configure,ffmpeg,x86_64,unix))

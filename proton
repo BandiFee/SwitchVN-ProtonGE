@@ -1865,6 +1865,12 @@ class Session:
 
         self.env["ESPEAK_DATA_PATH"] = g_proton.dist_dir + "share"
 
+        # winedmo decodes video on the Tegra video engine when there is one and
+        # falls back to software on its own, so this only needs to be set to
+        # override that decision, e.g. to rule the engine out while debugging.
+        if "PROTON_VIDEO_HWDECODE" in self.env:
+            self.env["WINE_VIDEO_HWDECODE"] = "1" if nonzero(self.env["PROTON_VIDEO_HWDECODE"]) else "0"
+
         prepend_to_env_str(self.env, "PATH", g_proton.bin_dir, ":")
 
     def check_environment(self, env_name, config_name):

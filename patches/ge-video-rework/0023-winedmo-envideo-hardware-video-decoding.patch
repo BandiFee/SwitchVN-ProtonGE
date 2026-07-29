@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 29 Jul 2026 00:00:00 +0800
+Subject: [PATCH] winedmo: add envideo hardware video decoding
+
+Visual novel engines play their videos through DirectShow, Media Foundation
+or ASF, all of which end up in the winedmo transform.  Decoding them in
+software is too slow on the Switch's Cortex-A57 cores, so hand the work to
+the Tegra video engine through FFmpeg's envideo hwaccel when one is
+available.
+
+Hardware surfaces are read back into system memory as soon as they leave
+the decoder, so the rest of winedmo is unchanged.  On Tegra that readback
+runs on the VIC, which also detiles the surface, keeping it off the CPU.
+
+Everything here is opportunistic: a missing device, a codec without an
+envideo hwaccel, or a stream the engine cannot handle all leave the
+transform decoding in software.  Set WINE_VIDEO_HWDECODE=0 to force it.
+---
+ dlls/winedmo/unix_transform.c | 149 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 145 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index 874aabd8d8..862bd711d1 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -31,6 +31,10 @@
+ 
+ #include <stdbool.h>
+ #include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++#include <libavutil/hwcontext.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/samplefmt.h>
+ #include <libswscale/swscale.h>
+@@ -58,6 +62,10 @@ struct unix_transform
+     AVPacket       *packet;        /* reusable input-packet container */
+     AVPacket       *parsed_packet; /* reusable packet for parser output */
+ 
++    /* Hardware decoding */
++    AVFrame           *sw_frame;   /* scratch frame for hardware surface readback */
++    enum AVPixelFormat hw_pix_fmt; /* AV_PIX_FMT_NONE when decoding in software */
++
+     bool is_audio;
+     bool is_raw_video;
+     bool draining;       /* NULL packet sent — flushing decoder */
+@@ -709,6 +717,134 @@ static NTSTATUS copy_video_frame( struct unix_transform *t, const AVFrame *frame
+     return STATUS_SUCCESS;
+ }
+ 
++/* -------------------------------------------------------------------------
++ * Hardware-accelerated video decoding
++ *
++ * Decoding is offloaded to a fixed-function video engine when libavcodec was
++ * built with support for one and the stream parameters fit within what the
++ * hardware can handle.  This is entirely opportunistic: every failure path
++ * below leaves the transform decoding in software, which is also what happens
++ * on hosts without a supported video engine.
++ *
++ * Decoded surfaces are read back into system memory immediately after they
++ * leave the decoder, so the rest of winedmo only ever sees software frames.
++ * On Tegra the readback runs on the VIC, which detiles the surface without
++ * involving the CPU.
++ * ------------------------------------------------------------------------- */
++
++/* The device is opened once and shared by every transform in the process:
++ * opening it per stream would allocate a separate engine channel each time. */
++static pthread_mutex_t hw_device_mutex = PTHREAD_MUTEX_INITIALIZER;
++static AVBufferRef *hw_device_ctx;
++static bool hw_device_probed;
++
++static enum AVHWDeviceType hw_device_type( void )
++{
++    const char *env = getenv( "WINE_VIDEO_HWDECODE" );
++
++    if (env && !strcmp( env, "0" )) return AV_HWDEVICE_TYPE_NONE;
++
++    /* Looked up by name so that winedmo still builds and runs against a
++     * libavutil that doesn't know about this device type. */
++    return av_hwdevice_find_type_by_name( "envideo" );
++}
++
++static AVBufferRef *get_hw_device_ctx( enum AVHWDeviceType type )
++{
++    AVBufferRef *ref = NULL;
++
++    pthread_mutex_lock( &hw_device_mutex );
++
++    if (!hw_device_probed)
++    {
++        hw_device_probed = true;
++        if (av_hwdevice_ctx_create( &hw_device_ctx, type, NULL, NULL, 0 ) < 0)
++        {
++            TRACE( "no usable %s device, decoding video in software\n", av_hwdevice_get_type_name( type ) );
++            hw_device_ctx = NULL;
++        }
++    }
++    if (hw_device_ctx) ref = av_buffer_ref( hw_device_ctx );
++
++    pthread_mutex_unlock( &hw_device_mutex );
++    return ref;
++}
++
++static enum AVPixelFormat transform_get_format( AVCodecContext *avctx, const enum AVPixelFormat *formats )
++{
++    const struct unix_transform *t = avctx->opaque;
++    const enum AVPixelFormat *fmt;
++
++    /* libavcodec copies opaque into its frame-threading contexts, so this is
++     * the transform even when called off a worker thread. */
++    if (t) for (fmt = formats; *fmt != AV_PIX_FMT_NONE; fmt++)
++        if (*fmt == t->hw_pix_fmt) return *fmt;
++
++    /* libavcodec drops the hardware format from the list and asks again when
++     * hwaccel setup fails, e.g. for a resolution the engine cannot decode. */
++    TRACE( "transform %p decoding in software\n", t );
++    return avcodec_default_get_format( avctx, formats );
++}
++
++/* Must be called before avcodec_open2(). */
++static void transform_init_hw_decoding( struct unix_transform *t, const AVCodec *codec )
++{
++    enum AVHWDeviceType type = hw_device_type();
++    const AVCodecHWConfig *config;
++    AVBufferRef *device;
++    int i;
++
++    t->hw_pix_fmt = AV_PIX_FMT_NONE;
++    if (type == AV_HWDEVICE_TYPE_NONE) return;
++
++    for (i = 0; (config = avcodec_get_hw_config( codec, i )); i++)
++    {
++        if (config->device_type != type) continue;
++        if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) continue;
++        break;
++    }
++    if (!config) return; /* codec has no hwaccel for this device */
++
++    if (!(device = get_hw_device_ctx( type ))) return;
++    if (!(t->sw_frame = av_frame_alloc()))
++    {
++        av_buffer_unref( &device );
++        return;
++    }
++
++    t->hw_pix_fmt = config->pix_fmt;
++    t->avctx->hw_device_ctx = device; /* released by avcodec_free_context */
++    t->avctx->opaque = t;
++    t->avctx->get_format = transform_get_format;
++
++    TRACE( "transform %p trying %s decoding for %s\n", t, av_hwdevice_get_type_name( type ), codec->name );
++}
++
++/* Receives a frame into t->frame, reading it back into system memory when the
++ * decoder produced a hardware surface. */
++static int transform_receive_frame( struct unix_transform *t )
++{
++    int ret;
++
++    av_frame_unref( t->frame );
++    if ((ret = avcodec_receive_frame( t->avctx, t->frame )) < 0) return ret;
++    if (!t->frame->hw_frames_ctx) return ret;
++
++    av_frame_unref( t->sw_frame );
++    if ((ret = av_hwframe_transfer_data( t->sw_frame, t->frame, 0 )) < 0)
++        WARN( "failed to read back hardware frame, ret %d\n", ret );
++    /* av_hwframe_transfer_data only moves pixels, timestamps and frame flags
++     * have to be carried over separately. */
++    else if ((ret = av_frame_copy_props( t->sw_frame, t->frame )) < 0)
++        WARN( "failed to copy hardware frame properties, ret %d\n", ret );
++
++    av_frame_unref( t->frame );
++    if (ret < 0) return ret;
++
++    av_frame_move_ref( t->frame, t->sw_frame );
++    return 0;
++}
++
+ /* -------------------------------------------------------------------------
+  * Unix-callable functions
+  * ------------------------------------------------------------------------- */
+@@ -729,6 +865,7 @@ NTSTATUS transform_create( void *arg )
+            out_fmt, params->output_format_size );
+ 
+     if (!(t = calloc( 1, sizeof(*t) ))) return STATUS_NO_MEMORY;
++    t->hw_pix_fmt = AV_PIX_FMT_NONE;
+     t->last_input_pts = INT64_MIN;
+     t->audio_output_pts_adjust = INT64_MIN;
+     t->last_video_pts = INT64_MIN;
+@@ -898,10 +1035,13 @@ NTSTATUS transform_create( void *arg )
+         }
+     }
+ 
++    if (!t->is_audio) transform_init_hw_decoding( t, codec );
++
+     if (avcodec_open2( t->avctx, codec, NULL ) < 0)
+     {
+         WARN( "avcodec_open2 failed for codec %s\n", codec->name );
+         avcodec_free_context( &t->avctx );
++        av_frame_free( &t->sw_frame );
+         free( t );
+         return STATUS_NOT_SUPPORTED;
+     }
+@@ -918,6 +1058,7 @@ NTSTATUS transform_create( void *arg )
+     {
+         if (t->parser) av_parser_close( t->parser );
+         av_frame_free( &t->frame );
++        av_frame_free( &t->sw_frame );
+         av_packet_free( &t->packet );
+         av_packet_free( &t->parsed_packet );
+         avcodec_free_context( &t->avctx );
+@@ -949,6 +1090,7 @@ NTSTATUS transform_destroy( void *arg )
+     if (t->parser) av_parser_close( t->parser );
+     avcodec_free_context( &t->avctx );
+     av_frame_free( &t->frame );
++    av_frame_free( &t->sw_frame );
+     av_packet_free( &t->packet );
+     av_packet_free( &t->parsed_packet );
+     if (t->swr) swr_free( &t->swr );
+@@ -997,8 +1139,7 @@ NTSTATUS transform_push_input( void *arg )
+     {
+         if (t->frame_pending) return STATUS_DEVICE_BUSY;
+ 
+-        av_frame_unref( t->frame );
+-        ret = avcodec_receive_frame( t->avctx, t->frame );
++        ret = transform_receive_frame( t );
+         if (ret >= 0)
+         {
+             t->frame_pending = true;
+@@ -1276,8 +1417,7 @@ NTSTATUS transform_get_output( void *arg )
+     {
+         for (;;)
+         {
+-            av_frame_unref( t->frame );
+-            ret = avcodec_receive_frame( t->avctx, t->frame );
++            ret = transform_receive_frame( t );
+             if (ret == AVERROR(EAGAIN)) { params->size = 0; return STATUS_MORE_PROCESSING_REQUIRED; }
+             if (ret == AVERROR_EOF)     { params->size = 0; return STATUS_END_OF_FILE; }
+             if (ret < 0)
+@@ -1584,6 +1724,7 @@ NTSTATUS transform_flush( void *arg )
+         t->parser = av_parser_init( t->parser_codec_id );
+     }
+     if (t->frame) av_frame_unref( t->frame );
++    if (t->sw_frame) av_frame_unref( t->sw_frame );
+     if (t->packet) av_packet_unref( t->packet );
+     if (t->parsed_packet) av_packet_unref( t->parsed_packet );
+     t->frame_pending      = false;

@@ -36,7 +36,8 @@
 	url = https://github.com/KhronosGroup/SPIRV-Headers
 [submodule "ffmpeg"]
 	path = ffmpeg
-	url = https://github.com/FFmpeg/FFmpeg
+	url = https://github.com/BandiFee/FFmpeg.git
+	branch = envideo
 [submodule "dav1d"]
 	path = dav1d
 	url = https://github.com/videolan/dav1d.git
