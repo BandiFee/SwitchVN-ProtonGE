@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Sat, 1 Aug 2026 00:00:00 +0800
+Subject: [PATCH] winedmo/wm_reader: treat a decommitted allocator as end of
+ stream
+
+Starting a video and then stopping it could make the game bail out with an
+error box:
+
+  warn:quartz:BaseMemAllocator_GetBuffer Not committed
+  err:wmvcore:wm_reader_read_stream_sample Failed to allocate sample of 11889 bytes, hr 0x80040211
+  trace:quartz:MediaEventSink_Notify graph, code 0x3, param1 0x80040211
+  trace:win:set_window_text L"Error Abort. : [0x80040211] Error: 0x80040211"
+
+Stopping the graph decommits the allocators, and that races against the
+reader thread, which may still be pulling samples.  wm_reader_read_stream_sample()
+passed VFW_E_NOT_COMMITTED straight back to its callers, which turned it into
+EC_ERRORABORT and the application aborted playback.
+
+A decommitted allocator only means the graph is going away, so report it the
+way the callers already handle a stream that has run out: NS_E_NO_MORE_SAMPLES
+marks the stream as EOS and everything winds down quietly.
+
+This is the same race that could deadlock the DMO wrapper; whichever side wins
+decides between the two symptoms.
+
+Found on ATRI -My Dear Moments- (AppId 1230140).
+---
+ dlls/winedmo/wm_reader.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index 1111111111..2222222222 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -2417,9 +2417,20 @@
+ 
+     if (FAILED(hr = wm_stream_allocate_sample(stream, capacity, sample)))
+     {
+-        ERR("Failed to allocate sample of %lu bytes, hr %#lx.\n", capacity, hr);
+         free(stream->current_data);
+         stream->current_data = NULL;
++
++        /* The allocator is decommitted while the graph is being stopped, which
++         * races with this thread still pulling samples.  That is not a failure:
++         * report it as the end of the stream so callers wind down quietly
++         * instead of raising EC_ERRORABORT at the application. */
++        if (hr == VFW_E_NOT_COMMITTED)
++        {
++            TRACE("Allocator is no longer committed, treating as end of stream.\n");
++            return NS_E_NO_MORE_SAMPLES;
++        }
++
++        ERR("Failed to allocate sample of %lu bytes, hr %#lx.\n", capacity, hr);
+         return hr;
+     }
+ 
