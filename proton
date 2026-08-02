@@ -2284,6 +2284,16 @@ class Session:
             self.dlloverrides["atidxx64"] = "b"
             self.dlloverrides["amd_ags_x64"] = "n"
 
+        # Media Foundation hands Direct3D-backed samples to the application by
+        # way of a shared texture, and the application picks them up through
+        # IDXGIResource::GetSharedHandle().  Tegra's Vulkan driver never gets
+        # VK_KHR_external_memory_win32, so DXVK cannot export one and the call
+        # fails; players are left with audio and a frozen picture.  Keep the
+        # device manager away from Media Foundation there so it falls back to
+        # system memory samples, which the hardware decoder feeds just fine.
+        if platform.machine() == "aarch64" and "mfdxgiman" not in self.compat_config:
+            self.env.setdefault("WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER", "1")
+
         if "nomfdxgiman" in self.compat_config:
             self.env["WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER"] = "1"
 
