@@ -1,7 +1,10 @@
 #See help target below for documentation
 
+VERSION_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))VERSION
+DEFAULT_BUILD_NAME := $(strip $(shell cat "$(VERSION_FILE)" 2>/dev/null))
+
 ifeq ($(build_name),)
-    _build_name := $(shell git symbolic-ref --short HEAD 2>/dev/null)-local
+    _build_name := $(DEFAULT_BUILD_NAME)
 else
     _build_name := $(build_name)
 endif
@@ -77,7 +80,7 @@ help:
 	@echo ""
 	@echo "Configuration variables:"
 	@echo "  build_name - The name of the build, will be displayed in Steam. Defaults to"
-	@echo "               current proton.git branch name if available. A new build dir"
+	@echo "               the SwitchVN release name stored in VERSION. A new build dir"
 	@echo "               will be created for each build_name, so if you override this,"
 	@echo "               remember to always set it!"
 	@echo "               Current build name: $(_build_name)"
@@ -98,7 +101,7 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make install - Build Proton and install into this user's Steam installation,"
-	@echo "      with the current Proton branch name as the tool's name."
+	@echo "      with the SwitchVN release name as the tool's name."
 	@echo ""
 	@echo "  make redist - Build a Proton redistribution package in a tagged directory"
 	@echo "      in $(BUILD_ROOT)/."

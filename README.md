@@ -1,14 +1,12 @@
-> [!Caution]
->  **Myself (GloriousEggroll) and this project (GE-Proton) are not affiliated with any other websites related to GE-Proton. There is no existing website for GE-Proton other than this GitHub repository.**
+# SwitchVN Proton
 
 > [!Important]
-> **If you have an issue that happens with my GE-Proton build, provided from this repository, that does not happen on Valve's Proton, please do not open a bug report on Valve's bug tracker.**
+> **SwitchVN Proton is an unofficial SwitchVN build based on GE-Proton11-3. It is not affiliated with or supported by Valve or the GE-Proton project.**
 >
-> Instead, open an issue on this repository's issue tracker: https://github.com/GloriousEggroll/proton-ge-custom/issues
->
-> or contact me on Discord about the issue: https://discord.gg/6y3BdzC
+> Report issues specific to this fork at [BandiFee/SwitchVN-ProtonGE](https://github.com/BandiFee/SwitchVN-ProtonGE/issues). Do not report fork-only issues to Valve or upstream GE-Proton.
 
-# GE-Proton
+> [!Note]
+> The usage and build documentation below is derived from the upstream GE-Proton documentation. SwitchVN releases use the `GE-Proton11-3-SwitchVN` build identifier.
 
 > [!Warning]
 > **Running non-Steam games with GE-Proton outside of Steam is only supported using [umu](https://github.com/Open-Wine-Components/umu-launcher):**
@@ -22,11 +20,7 @@
 >[Lutris](https://lutris.net/) has integrated umu as the default backend used when `GE-Proton (Latest)` is selected as a Wine runner either globally or for any specific game.
 
 > [!Note]
-> (1) Please note, this is a custom build of Proton, and is not affiliated with Valve's Proton.
-> 
-> (2) Please also note I will not assist with unofficial builds of GE-Proton. The only version of GE-Proton that I provide and will assist with builds of is the one provided within this repository, using the build system documented here.
-> 
-> (3) I cannot validate the accuracy or functionality of other builds that have not been built using the build system included here.
+> This is a custom Proton build. Valve and upstream GE-Proton support do not cover this fork.
 
 ## Table of contents
 
@@ -56,9 +50,9 @@
 
 ## Overview
 
-This is my build of Proton with the most recent bleeding-edge Proton Experimental Wine.
+This SwitchVN build is based on GE-Proton11-3 and adds SwitchVN media-playback fixes and NVIDIA Tegra hardware decoding through Envideo to the upstream GE-Proton feature set.
 
-Things it contains that Valve's Proton currently does not:
+Upstream GE-Proton features include:
 
 - Additional media foundation patches for better video playback support
 - AMD FSR patches added directly to fullscreen hack that can be toggled with WINE_FULLSCREEN_FSR=1
