@@ -1,5 +1,8 @@
 name: _job_upload
 
+permissions:
+  contents: write
+
 on:
   workflow_call:
     inputs:
