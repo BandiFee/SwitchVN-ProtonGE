@@ -59,6 +59,25 @@ jobs:
           patch -Np1 -i ./.github/patches/0001-build-strip-binaries-early.patch
           mkdir ./build
 
+      - name: Verify the SwitchVN patches applied
+        # protonprep runs with `|| true`, so a patch that fails to apply would
+        # otherwise produce a build that looks fine and silently has no hardware
+        # video decoding. Fail here instead.
+        run: |
+          fail=0
+          check() {
+            if grep -q "$2" "$1"; then
+              echo "ok   $3"
+            else
+              echo "FAIL $3 (expected '$2' in $1)"
+              fail=1
+            fi
+          }
+          check wine/dlls/winedmo/unix_transform.c "transform_init_hw_decoding" "envideo hardware decoding"
+          check wine/dlls/qasf/dmowrapper.c       "Decommit the output allocators" "dmowrapper stop-path deadlock fix"
+          check wine/dlls/winedmo/wm_reader.c     "no longer committed"            "wm_reader decommit handling"
+          exit $fail
+
       - name: Configure
         working-directory: ./build
         run: |
