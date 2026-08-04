@@ -299,7 +299,7 @@ $(OBJ)/.bzip2-%-build:
 FFMPEG_DEPENDS = bzip2 dav1d xz
 
 FFMPEG_CONFIGURE_ARGS := \
-	--extra-version=SwitchVN \
+	--extra-version=SwitchVN-1 \
 	--enable-shared \
 	--disable-static \
 	--disable-everything \

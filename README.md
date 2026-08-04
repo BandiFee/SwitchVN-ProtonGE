@@ -6,7 +6,7 @@
 > Report issues specific to this fork at [BandiFee/SwitchVN-ProtonGE](https://github.com/BandiFee/SwitchVN-ProtonGE/issues). Do not report fork-only issues to Valve or upstream GE-Proton.
 
 > [!Note]
-> The usage and build documentation below is derived from the upstream GE-Proton documentation. SwitchVN releases use the `GE-Proton11-3-SwitchVN` build identifier.
+> The usage and build documentation below is derived from the upstream GE-Proton documentation. SwitchVN releases use the `GE-Proton11-3-SwitchVN-1` build identifier, where the trailing number is the SwitchVN revision of that upstream base.
 
 > [!Warning]
 > **Running non-Steam games with GE-Proton outside of Steam is only supported using [umu](https://github.com/Open-Wine-Components/umu-launcher):**

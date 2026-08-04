@@ -38,6 +38,9 @@ jobs:
       id: create
       shell: bash
       run: |
+        # gh rejects --notes-from-tag together with --repo. This job checks the
+        # repository out at the workspace root, so gh can infer it from the git
+        # remote and --repo is unnecessary on the create call.
         if gh release view "${{ github.ref_name }}" --repo "${{ github.server_url }}/${{ github.repository }}" &>/dev/null; then
           echo "Release ${{ github.ref_name }} already exists. Skipping creation."
         else
@@ -45,8 +48,7 @@ jobs:
             --latest \
             --title "${{ github.ref_name }} Released" \
             --notes-from-tag \
-            --verify-tag \
-            --repo "${{ github.server_url }}/${{ github.repository }}"
+            --verify-tag
         fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
