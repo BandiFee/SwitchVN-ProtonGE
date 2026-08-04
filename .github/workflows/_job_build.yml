@@ -31,6 +31,12 @@ jobs:
             /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle /usr/share/az*
             /usr/local/.ghcup
 
+      - name: Report free disk space
+        # Disk is the constraint that decides whether this job can run at all.
+        # Print it rather than guess, and print it again after the build so a
+        # failure elsewhere can be told apart from simply running out of room.
+        run: df -h /
+
       - name: Prepare host
         run: sudo apt update && sudo apt-get install -y ccache fontforge-nox
 
@@ -92,6 +98,10 @@ jobs:
         working-directory: ./build
         run: |
           make -j$(nproc) redist
+
+      - name: Report free disk space after build
+        if: always()
+        run: df -h /
 
       - name: Save cache
         id: ccache-save
