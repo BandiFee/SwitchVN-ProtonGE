@@ -76,6 +76,11 @@ jobs:
           check wine/dlls/winedmo/unix_transform.c "transform_init_hw_decoding" "envideo hardware decoding"
           check wine/dlls/qasf/dmowrapper.c       "Decommit the output allocators" "dmowrapper stop-path deadlock fix"
           check wine/dlls/winedmo/wm_reader.c     "no longer committed"            "wm_reader decommit handling"
+          # Not a patch but part of the same fix set, and it has been dropped by
+          # a branch rewrite once already.
+          # Upstream already has a nomfdxgiman option, so match the SwitchVN
+          # default instead of the environment variable name.
+          check proton '"mfdxgiman" not in self.compat_config' "aarch64 Media Foundation system-memory default"
           exit $fail
 
       - name: Configure
