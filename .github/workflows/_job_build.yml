@@ -6,6 +6,11 @@ on:
       name:
         required: true
         type: string
+      ref:
+        description: 'Ref to build; defaults to whatever triggered the run'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   proton:
@@ -52,6 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
           fetch-tags: true
           submodules: false

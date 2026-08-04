@@ -9,9 +9,20 @@ on:
   push:
     tags:
       - 'GE-Proton*-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. GE-Proton11-3-SwitchVN-1)'
+        required: true
+
+# A tag push sets ref_name to the tag; a manual run sets it to the branch, so
+# the tag has to come from the input instead. Everything downstream - the build
+# name, the release, the asset names - derives from this one value.
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 concurrency:
-  group: ${{ github.ref_name }}
+  group: ${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -19,7 +30,10 @@ jobs:
     name: Build
     uses: ./.github/workflows/_job_build.yml
     with:
-      name: ${{ github.ref_name }}
+      name: ${{ github.event.inputs.tag || github.ref_name }}
+      # Build the tag's tree, not the branch head, so the asset matches the tag
+      # even when the run was started by hand well after the tag was made.
+      ref: ${{ github.event.inputs.tag || github.ref_name }}
 
   release:
     name: Release
@@ -41,26 +55,22 @@ jobs:
         # gh rejects --notes-from-tag together with --repo. This job checks the
         # repository out at the workspace root, so gh can infer it from the git
         # remote and --repo is unnecessary on the create call.
-        if gh release view "${{ github.ref_name }}" --repo "${{ github.server_url }}/${{ github.repository }}" &>/dev/null; then
-          echo "Release ${{ github.ref_name }} already exists. Skipping creation."
+        if gh release view "$TAG" --repo "${{ github.server_url }}/${{ github.repository }}" &>/dev/null; then
+          echo "Release $TAG already exists. Skipping creation."
         else
-          gh release create "${{ github.ref_name }}" \
+          gh release create "$TAG" \
             --latest \
-            --title "${{ github.ref_name }} Released" \
+            --title "$TAG Released" \
             --notes-from-tag \
             --verify-tag
         fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
+
   upload:
     name: Upload
     needs: release
-    strategy:
-      matrix:
-        include:
-          - name: ${{ github.ref_name }}
     uses: ./.github/workflows/_job_upload.yml
     with:
-      version: ${{ github.ref_name }}
-      name: ${{ matrix.name }}
+      version: ${{ github.event.inputs.tag || github.ref_name }}
+      name: ${{ github.event.inputs.tag || github.ref_name }}
