@@ -64,9 +64,21 @@ jobs:
 
       - name: Patch
         run: |
-          # Some submodules come from hosts that rate-limit CI. sourceware.org
-          # has answered 429 for bzip2, which failed the whole job in its first
-          # minute and threw away a queue slot for a build that takes hours.
+          # sourceware.org rate-limits GitHub runners: the bzip2 submodule came
+          # back 429 on every one of five attempts across five minutes, while
+          # the same URL served fine from outside CI. Take it from a mirror
+          # holding the pinned commit (6a8690fc, "Prepare for 1.0.8 release").
+          #
+          # Rewriting the URL rather than editing .gitmodules keeps the change
+          # out of the tree, so merging upstream GE does not conflict here. A
+          # mirror missing the commit fails the checkout outright rather than
+          # quietly substituting a different one.
+          git config --global \
+            url."https://github.com/libarchive/bzip2.git".insteadOf \
+            "https://sourceware.org/git/bzip2.git"
+
+          # Other submodule hosts can still hiccup, and this job is hours long,
+          # so a transient failure should not cost the whole queue slot.
           for attempt in 1 2 3 4 5; do
             if git submodule update --init --filter=tree:0 --recursive; then
               break
