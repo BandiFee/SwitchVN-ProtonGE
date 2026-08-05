@@ -2291,7 +2291,15 @@ class Session:
         # fails; players are left with audio and a frozen picture.  Keep the
         # device manager away from Media Foundation there so it falls back to
         # system memory samples, which the hardware decoder feeds just fine.
-        if platform.machine() == "aarch64" and "mfdxgiman" not in self.compat_config:
+        #
+        # Probe for the hardware rather than the architecture.  This script is
+        # the runtime's x86_64 Python running under Box64, whose uname wrapper
+        # overwrites machine with "x86_64" unconditionally so that the programs
+        # it emulates see a consistent target -- platform.machine() therefore
+        # never reports aarch64 here, and the check this replaces was dead from
+        # the day it was written.  /dev/nvhost-nvdec is the Tegra multimedia
+        # engine node, which is the actual condition anyway.
+        if os.path.exists("/dev/nvhost-nvdec") and "mfdxgiman" not in self.compat_config:
             self.env.setdefault("WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER", "1")
 
         if "nomfdxgiman" in self.compat_config:

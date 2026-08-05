@@ -90,9 +90,17 @@ jobs:
           check wine/dlls/winedmo/wm_reader.c     "no longer committed"            "wm_reader decommit handling"
           # Not a patch but part of the same fix set, and it has been dropped by
           # a branch rewrite once already.
-          # Upstream already has a nomfdxgiman option, so match the SwitchVN
-          # default instead of the environment variable name.
-          check proton '"mfdxgiman" not in self.compat_config' "aarch64 Media Foundation system-memory default"
+          # Match the condition, not just the option name: upstream already has
+          # a nomfdxgiman option, and the first version of this default keyed on
+          # platform.machine() == "aarch64", which never fires because Box64's
+          # uname wrapper reports x86_64 to the runtime Python this script runs
+          # under. It has to probe for the Tegra node instead.
+          check proton 'os.path.exists("/dev/nvhost-nvdec") and "mfdxgiman" not in self.compat_config' \
+                "Media Foundation system-memory default, keyed on the Tegra node"
+          if grep -q 'platform.machine() == "aarch64" and "mfdxgiman"' proton; then
+            echo "FAIL the Media Foundation default is keyed on platform.machine(), which is x86_64 under Box64"
+            fail=1
+          fi
           exit $fail
 
       - name: Configure
