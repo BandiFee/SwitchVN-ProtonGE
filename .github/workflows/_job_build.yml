@@ -64,7 +64,20 @@ jobs:
 
       - name: Patch
         run: |
-          git submodule update --init --filter=tree:0 --recursive
+          # Some submodules come from hosts that rate-limit CI. sourceware.org
+          # has answered 429 for bzip2, which failed the whole job in its first
+          # minute and threw away a queue slot for a build that takes hours.
+          for attempt in 1 2 3 4 5; do
+            if git submodule update --init --filter=tree:0 --recursive; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::submodule checkout still failing after $attempt attempts"
+              exit 1
+            fi
+            echo "submodule checkout failed (attempt $attempt), retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          done
           # apply proton-ge-custom patches
           ./patches/protonprep-valve-staging.sh || true
           # strip binaries at compile time to save space in the runner
