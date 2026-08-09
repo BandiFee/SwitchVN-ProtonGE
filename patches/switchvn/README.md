@@ -10,3 +10,4 @@ filename order.
 - `0025`: WM reader decommitted allocator end-of-stream handling.
 - `0026`: DirectShow `CLSID_Colour` converter compatibility.
 - `0027`: MPEG sequence-header recovery for zero-size video formats.
+- `0028`: Reject zero-size MPEG output types during downstream negotiation.

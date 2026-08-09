@@ -1,0 +1,69 @@
+From 7c462cbf546487a97c3e2f51e2a7fd9e30cd8902 Mon Sep 17 00:00:00 2001
+From: BandiFee <bandifee@gmail.com>
+Date: Sun, 9 Aug 2026 18:42:00 +0800
+Subject: [PATCH] winedmo: Reject zero-size MPEG output media types
+
+The DirectShow colour converter enumerates generic input media types with
+zero width and height before it is connected.  When the MPEG decoder output
+pin is connected to it, strmbase tries those sink types before the decoder's
+own fully specified types.  The MPEG decoder accepted the generic YV12 type
+and replaced its correctly recovered dimensions with zeroes, leaving the
+renderer unable to allocate a surface.
+
+Reject video output types with a zero width or height so connection
+negotiation falls back to the decoder's own concrete media type.
+---
+ dlls/quartz/tests/mpegvideo.c    | 14 ++++++++++++++
+ dlls/winedmo/quartz_transform.c |  5 +++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/dlls/quartz/tests/mpegvideo.c b/dlls/quartz/tests/mpegvideo.c
+index fd5f19cb82..919f48ac07 100644
+--- a/dlls/quartz/tests/mpegvideo.c
++++ b/dlls/quartz/tests/mpegvideo.c
+@@ -1870,6 +1870,20 @@ static void test_connect_pin(void)
+     hr = IPin_QueryAccept(source, &yuy2_mt);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
++    req_mt = yuy2_mt;
++    req_format = yuy2_format;
++    req_mt.pbFormat = (BYTE *)&req_format;
++    req_format.bmiHeader.biWidth = 0;
++    hr = IPin_QueryAccept(source, &req_mt);
++    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++
++    req_mt = yuy2_mt;
++    req_format = yuy2_format;
++    req_mt.pbFormat = (BYTE *)&req_format;
++    req_format.bmiHeader.biHeight = 0;
++    hr = IPin_QueryAccept(source, &req_mt);
++    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++
+     req_mt = yuy2_mt;
+     req_mt.majortype = GUID_NULL;
+     hr = IPin_QueryAccept(source, &req_mt);
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 8bbadcb224..3858a64cf1 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -1022,6 +1022,7 @@ static HRESULT mpeg_video_codec_sink_query_accept(struct transform *filter, cons
+ 
+ static HRESULT mpeg_video_codec_source_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
+ {
++    const VIDEOINFOHEADER *format;
+     if (!filter->sink.pin.peer)
+         return S_FALSE;
+ 
+@@ -1030,6 +1031,10 @@ static HRESULT mpeg_video_codec_source_query_accept(struct transform *filter, co
+             || mt->cbFormat < sizeof(VIDEOINFOHEADER))
+         return S_FALSE;
+ 
++    format = (const VIDEOINFOHEADER *)mt->pbFormat;
++    if (!format->bmiHeader.biWidth || !format->bmiHeader.biHeight)
++        return S_FALSE;
++
+     if (!IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_YV12)
+             /* missing: MEDIASUBTYPE_Y41P, not supported by winedmo */
+             && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_YUY2)
+-- 
+2.54.0

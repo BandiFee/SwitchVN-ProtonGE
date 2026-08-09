@@ -3,7 +3,10 @@
 # patch functions
 apply_patch() {
     local patch_path="$1"
-    patch -Np1 < "$patch_path"
+    if ! patch --batch -Np1 < "$patch_path"; then
+        echo "FAILED to apply $patch_path" >&2
+        exit 1
+    fi
 }
 
 apply_all_in_dir() {
@@ -38,6 +41,13 @@ apply_all_in_dir() {
 
     echo "WINE: -SWITCHVN- Apply SwitchVN compatibility patches"
     apply_all_in_dir "../patches/switchvn/"
+
+    if ! grep -Fq "CLSID_Colour" dlls/qasf/qasf_main.c \
+            || ! grep -Fq "mpeg_video_codec_get_sequence_format" dlls/winedmo/quartz_transform.c \
+            || ! grep -Fq "!format->bmiHeader.biWidth || !format->bmiHeader.biHeight" dlls/winedmo/quartz_transform.c; then
+        echo "FAILED: SwitchVN video patch sentinel is missing" >&2
+        exit 1
+    fi
 
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
