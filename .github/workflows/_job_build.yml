@@ -98,8 +98,8 @@ jobs:
 
       - name: Verify the SwitchVN patches applied
         # protonprep runs with `|| true`, so a patch that fails to apply would
-        # otherwise produce a build that looks fine and silently has no hardware
-        # video decoding. Fail here instead.
+        # otherwise produce a build that looks fine and silently miss required
+        # video fixes. Fail here instead.
         run: |
           fail=0
           check() {
@@ -113,6 +113,9 @@ jobs:
           check wine/dlls/winedmo/unix_transform.c "transform_init_hw_decoding" "envideo hardware decoding"
           check wine/dlls/qasf/dmowrapper.c       "Decommit the output allocators" "dmowrapper stop-path deadlock fix"
           check wine/dlls/winedmo/wm_reader.c     "no longer committed"            "wm_reader decommit handling"
+          check wine/dlls/qasf/qasf_main.c        "CLSID_Colour"                    "DirectShow color converter registration"
+          check wine/dlls/qasf/qasf_classes.idl   "1643e180-90f5-11ce-97d5-00aa0055595a" "color converter COM registry"
+          check wine/dlls/winedmo/color_convert.c "create_dmo_media_type"           "color converter DMO adapter"
           # Not a patch but part of the same fix set, and it has been dropped by
           # a branch rewrite once already.
           # Match the condition, not just the option name: upstream already has
@@ -161,4 +164,3 @@ jobs:
         with:
           name: ${{ inputs.name }}.sha512sum
           path: ./build/${{ inputs.name }}.sha512sum
-

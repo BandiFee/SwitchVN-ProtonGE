@@ -1,0 +1,701 @@
+From 793ccc847bf57822154b08221a2bf89cef3312c0 Mon Sep 17 00:00:00 2001
+From: SwitchVN contributors <switchvn@local>
+Date: Sun, 9 Aug 2026 10:57:00 +0800
+Subject: [PATCH] qasf: Expose the DirectShow color space converter
+
+Register CLSID_Colour as a qasf DMO wrapper around the private winedmo color converter, and implement the converter IMediaObject adapter required by DirectShow.
+---
+ dlls/qasf/dmowrapper.c       |  37 ++++-
+ dlls/qasf/qasf_classes.idl   |   7 +
+ dlls/qasf/qasf_main.c        |   3 +
+ dlls/qasf/qasf_private.h     |   1 +
+ dlls/qasf/tests/dmowrapper.c | 166 ++++++++++++++++++++++
+ dlls/winedmo/color_convert.c | 264 ++++++++++++++++++++++++++++++-----
+ 6 files changed, 437 insertions(+), 41 deletions(-)
+
+diff --git a/dlls/qasf/dmowrapper.c b/dlls/qasf/dmowrapper.c
+index 301b05899e..26e225cb7b 100644
+--- a/dlls/qasf/dmowrapper.c
++++ b/dlls/qasf/dmowrapper.c
+@@ -761,7 +761,7 @@ static HRESULT WINAPI dmo_wrapper_filter_Init(IDMOWrapperFilter *iface, REFCLSID
+         free(buffers);
+         IMediaObject_Release(dmo);
+         IUnknown_Release(unk);
+-        return hr;
++        return E_OUTOFMEMORY;
+     }
+ 
+     for (i = 0; i < input_count; ++i)
+@@ -980,7 +980,7 @@ static struct strmbase_filter_ops filter_ops =
+     .filter_cleanup_stream = dmo_wrapper_cleanup_stream,
+ };
+ 
+-HRESULT dmo_wrapper_create(IUnknown *outer, IUnknown **out)
++static HRESULT dmo_wrapper_create_with_clsid(IUnknown *outer, const CLSID *clsid, IUnknown **out)
+ {
+     struct dmo_wrapper *object;
+ 
+@@ -988,7 +988,7 @@ HRESULT dmo_wrapper_create(IUnknown *outer, IUnknown **out)
+         return E_OUTOFMEMORY;
+ 
+     /* Always pass NULL as the outer object; see test_aggregation(). */
+-    strmbase_filter_init(&object->filter, NULL, &CLSID_DMOWrapperFilter, &filter_ops);
++    strmbase_filter_init(&object->filter, NULL, clsid, &filter_ops);
+ 
+     object->IDMOWrapperFilter_iface.lpVtbl = &dmo_wrapper_filter_vtbl;
+     object->IAMFilterMiscFlags_iface.lpVtbl = &dmo_wrapper_misc_flags_vtbl;
+@@ -1000,3 +1000,34 @@ HRESULT dmo_wrapper_create(IUnknown *outer, IUnknown **out)
+ 
+     return S_OK;
+ }
++
++HRESULT dmo_wrapper_create(IUnknown *outer, IUnknown **out)
++{
++    return dmo_wrapper_create_with_clsid(outer, &CLSID_DMOWrapperFilter, out);
++}
++
++HRESULT color_converter_create(IUnknown *outer, IUnknown **out)
++{
++    static const GUID CLSID_winedmo_color_converter =
++            {0xf47e2da5,0xe370,0x47b7,{0x90,0x3a,0x07,0x8d,0xdd,0x45,0xa5,0xcc}};
++    IDMOWrapperFilter *wrapper;
++    IUnknown *unknown;
++    HRESULT hr;
++
++    if (FAILED(hr = dmo_wrapper_create_with_clsid(outer, &CLSID_Colour, &unknown)))
++        return hr;
++
++    if (SUCCEEDED(hr = IUnknown_QueryInterface(unknown, &IID_IDMOWrapperFilter, (void **)&wrapper)))
++    {
++        hr = IDMOWrapperFilter_Init(wrapper, &CLSID_winedmo_color_converter, &DMOCATEGORY_VIDEO_EFFECT);
++        IDMOWrapperFilter_Release(wrapper);
++    }
++    if (FAILED(hr))
++    {
++        IUnknown_Release(unknown);
++        return hr;
++    }
++
++    *out = unknown;
++    return S_OK;
++}
+diff --git a/dlls/qasf/qasf_classes.idl b/dlls/qasf/qasf_classes.idl
+index b6f6c58fed..fe2fc1522c 100644
+--- a/dlls/qasf/qasf_classes.idl
++++ b/dlls/qasf/qasf_classes.idl
+@@ -26,6 +26,13 @@
+ ]
+ coclass DMOWrapperFilter {}
+ 
++[
++    helpstring("Color Space Converter"),
++    threading(both),
++    uuid(1643e180-90f5-11ce-97d5-00aa0055595a),
++]
++coclass Colour {}
++
+ [
+     helpstring("WM ASF Reader"),
+     threading(both),
+diff --git a/dlls/qasf/qasf_main.c b/dlls/qasf/qasf_main.c
+index d32a9da12b..9ae2cc531a 100644
+--- a/dlls/qasf/qasf_main.c
++++ b/dlls/qasf/qasf_main.c
+@@ -98,6 +98,7 @@ static const IClassFactoryVtbl class_factory_vtbl =
+ 
+ static struct class_factory asf_reader_cf = {{&class_factory_vtbl}, asf_reader_create};
+ static struct class_factory dmo_wrapper_cf = {{&class_factory_vtbl}, dmo_wrapper_create};
++static struct class_factory color_converter_cf = {{&class_factory_vtbl}, color_converter_create};
+ 
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ {
+@@ -118,6 +119,8 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
+ 
+     if (IsEqualGUID(clsid, &CLSID_DMOWrapperFilter))
+         return IClassFactory_QueryInterface(&dmo_wrapper_cf.IClassFactory_iface, iid, out);
++    if (IsEqualGUID(clsid, &CLSID_Colour))
++        return IClassFactory_QueryInterface(&color_converter_cf.IClassFactory_iface, iid, out);
+     if (IsEqualGUID(clsid, &CLSID_WMAsfReader))
+         return IClassFactory_QueryInterface(&asf_reader_cf.IClassFactory_iface, iid, out);
+ 
+diff --git a/dlls/qasf/qasf_private.h b/dlls/qasf/qasf_private.h
+index 7b00ddf0c6..45ef29302c 100644
+--- a/dlls/qasf/qasf_private.h
++++ b/dlls/qasf/qasf_private.h
+@@ -31,5 +31,6 @@
+ 
+ HRESULT asf_reader_create(IUnknown *outer, IUnknown **out);
+ HRESULT dmo_wrapper_create(IUnknown *outer, IUnknown **out);
++HRESULT color_converter_create(IUnknown *outer, IUnknown **out);
+ 
+ #endif /* QASF_PRIVATE_H */
+diff --git a/dlls/qasf/tests/dmowrapper.c b/dlls/qasf/tests/dmowrapper.c
+index b8d033d7a8..b00885b89b 100644
+--- a/dlls/qasf/tests/dmowrapper.c
++++ b/dlls/qasf/tests/dmowrapper.c
+@@ -1230,6 +1230,23 @@ static HRESULT WINAPI testsink_Receive(struct strmbase_sink *iface, IMediaSample
+ 
+     ++got_Receive;
+ 
++    if (testmode == 200)
++    {
++        BYTE *data;
++
++        len = IMediaSample_GetActualDataLength(sample);
++        ok(len == 16, "Got length %ld.\n", len);
++        hr = IMediaSample_GetPointer(sample, &data);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            for (i = 0; i < len && !data[i]; ++i) {}
++            ok(i != len, "Expected non-empty RGB32 output.\n");
++        }
++        SetEvent(filter->event);
++        return S_OK;
++    }
++
+     len = IMediaSample_GetSize(sample);
+     if (testmode == 100)
+         ok(len == 555, "Got size %lu.\n", len);
+@@ -2593,6 +2610,154 @@ static void test_uninitialized(void)
+     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+ }
+ 
++static void test_colour_converter(void)
++{
++    VIDEOINFOHEADER input_vih = {.bmiHeader = {sizeof(BITMAPINFOHEADER), 2, 2, 1, 16,
++            MAKEFOURCC('Y','U','Y','2'), 8}};
++    VIDEOINFOHEADER output_vih = {.bmiHeader = {sizeof(BITMAPINFOHEADER), 2, 2, 1, 32,
++            BI_RGB, 16}};
++    AM_MEDIA_TYPE input_mt = {MEDIATYPE_Video, MEDIASUBTYPE_YUY2, TRUE, FALSE, 8,
++            FORMAT_VideoInfo, NULL, sizeof(input_vih), (BYTE *)&input_vih};
++    AM_MEDIA_TYPE output_mt = {MEDIATYPE_Video, MEDIASUBTYPE_RGB32, TRUE, FALSE, 16,
++            FORMAT_VideoInfo, NULL, sizeof(output_vih), (BYTE *)&output_vih};
++    static const BYTE frame[] = {81, 90, 145, 240, 41, 240, 210, 110};
++    struct testfilter testsource, testsink;
++    IMediaControl *control = NULL;
++    IMemInputPin *input = NULL;
++    IMediaSample *sample = NULL;
++    IMediaFilter *media_filter;
++    IBaseFilter *filter;
++    IUnknown *unknown;
++    IEnumPins *enum_pins;
++    IPersist *persist;
++    IFilterGraph2 *graph;
++    PIN_DIRECTION direction;
++    IPin *pins[3] = {0};
++    CLSID clsid;
++    ULONG count;
++    DWORD wait;
++    BYTE *data;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_Colour, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&filter);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++        return;
++
++    hr = IBaseFilter_QueryInterface(filter, &IID_IUnknown, (void **)&unknown);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr)) IUnknown_Release(unknown);
++
++    hr = IBaseFilter_QueryInterface(filter, &IID_IMediaFilter, (void **)&media_filter);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr)) IMediaFilter_Release(media_filter);
++
++    hr = IBaseFilter_QueryInterface(filter, &IID_IPersist, (void **)&persist);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IPersist_GetClassID(persist, &clsid);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        ok(IsEqualGUID(&clsid, &CLSID_Colour), "Got class ID %s.\n", wine_dbgstr_guid(&clsid));
++        IPersist_Release(persist);
++    }
++
++    hr = IBaseFilter_EnumPins(filter, &enum_pins);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IEnumPins_Next(enum_pins, ARRAY_SIZE(pins), pins, &count);
++        ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++        ok(count == 2, "Got %lu pins.\n", count);
++        if (count > 0)
++        {
++            hr = IPin_QueryDirection(pins[0], &direction);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++            ok(direction == PINDIR_INPUT, "Got direction %u.\n", direction);
++        }
++        if (count > 1)
++        {
++            hr = IPin_QueryDirection(pins[1], &direction);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++            ok(direction == PINDIR_OUTPUT, "Got direction %u.\n", direction);
++        }
++        if (count > 2) IPin_Release(pins[2]);
++        IEnumPins_Release(enum_pins);
++    }
++
++    testfilter_init(&testsource);
++    testfilter_init(&testsink);
++    testsink.sink_mt = &output_mt;
++    hr = CoCreateInstance(&CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IFilterGraph2, (void **)&graph);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        IFilterGraph2_AddFilter(graph, &testsource.filter.IBaseFilter_iface, L"source");
++        IFilterGraph2_AddFilter(graph, filter, L"Colour");
++        IFilterGraph2_AddFilter(graph, &testsink.filter.IBaseFilter_iface, L"sink");
++        if (pins[0] && pins[1])
++        {
++            hr = IFilterGraph2_ConnectDirect(graph, &testsource.source.pin.IPin_iface,
++                    pins[0], &input_mt);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++            hr = IFilterGraph2_ConnectDirect(graph, pins[1], &testsink.sink.pin.IPin_iface,
++                    &output_mt);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = IPin_QueryInterface(pins[0], &IID_IMemInputPin, (void **)&input);
++                ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                hr = IFilterGraph2_QueryInterface(graph, &IID_IMediaControl, (void **)&control);
++                ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                if (input && control)
++                {
++                    hr = IMediaControl_Pause(control);
++                    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                    ok(!!testsource.source.pAllocator, "Expected an input allocator.\n");
++                    if (testsource.source.pAllocator)
++                    {
++                        hr = IMemAllocator_GetBuffer(testsource.source.pAllocator, &sample, NULL, NULL, 0);
++                        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                        if (SUCCEEDED(hr))
++                        {
++                            hr = IMediaSample_GetPointer(sample, &data);
++                            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                            if (SUCCEEDED(hr))
++                            {
++                                memcpy(data, frame, sizeof(frame));
++                                hr = IMediaSample_SetActualDataLength(sample, sizeof(frame));
++                                ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                                IMediaSample_SetSyncPoint(sample, TRUE);
++                                got_Receive = 0;
++                                testmode = 200;
++                                hr = IMemInputPin_Receive(input, sample);
++                                ok(hr == S_OK, "Got hr %#lx.\n", hr);
++                                wait = WaitForSingleObject(testsink.event, 5000);
++                                ok(wait == WAIT_OBJECT_0, "Wait returned %#lx.\n", wait);
++                                ok(got_Receive == 1, "Got %u calls to Receive().\n", got_Receive);
++                                testmode = 0;
++                            }
++                        }
++                    }
++                    IMediaControl_Stop(control);
++                }
++            }
++        }
++        if (sample) IMediaSample_Release(sample);
++        if (input) IMemInputPin_Release(input);
++        if (control) IMediaControl_Release(control);
++        IFilterGraph2_Release(graph);
++    }
++    if (pins[0]) IPin_Release(pins[0]);
++    if (pins[1]) IPin_Release(pins[1]);
++    IBaseFilter_Release(&testsource.filter.IBaseFilter_iface);
++    IBaseFilter_Release(&testsink.filter.IBaseFilter_iface);
++
++    IBaseFilter_Release(filter);
++}
++
+ START_TEST(dmowrapper)
+ {
+     DWORD cookie;
+@@ -2621,6 +2786,7 @@ START_TEST(dmowrapper)
+     test_enum_media_types();
+     test_connect_pin();
+     test_uninitialized();
++    test_colour_converter();
+ 
+     CoRevokeClassObject(cookie);
+     DMOUnregister(&testdmo_clsid, &DMOCATEGORY_AUDIO_DECODER);
+diff --git a/dlls/winedmo/color_convert.c b/dlls/winedmo/color_convert.c
+index 09c7e9515a..13427ceb76 100644
+--- a/dlls/winedmo/color_convert.c
++++ b/dlls/winedmo/color_convert.c
+@@ -23,6 +23,7 @@
+ #include "mferror.h"
+ #include "mfobjects.h"
+ #include "mftransform.h"
++#include "mediaerr.h"
+ #include "wmcodecdsp.h"
+ #include "wine/winedmo.h"
+ 
+@@ -31,6 +32,13 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
++#define DMO_INPUT_STREAMF_WHOLE_SAMPLES             0x00000001
++#define DMO_INPUT_STREAMF_SINGLE_SAMPLE_PER_BUFFER  0x00000002
++#define DMO_INPUT_STREAMF_FIXED_SAMPLE_SIZE         0x00000004
++#define DMO_OUTPUT_STREAMF_WHOLE_SAMPLES            0x00000001
++#define DMO_OUTPUT_STREAMF_SINGLE_SAMPLE_PER_BUFFER 0x00000002
++#define DMO_OUTPUT_STREAMF_FIXED_SAMPLE_SIZE        0x00000004
++
+ static const GUID *const input_types[] =
+ {
+     &MFVideoFormat_YV12,
+@@ -806,76 +814,197 @@ static ULONG WINAPI media_object_Release(IMediaObject *iface)
+     return IUnknown_Release(impl_from_IMediaObject(iface)->outer);
+ }
+ 
++static HRESULT create_dmo_media_type(IMFMediaType *base_type, const GUID *subtype,
++        DMO_MEDIA_TYPE *dmo_type)
++{
++    IMFMediaType *media_type;
++    AM_MEDIA_TYPE *am_type;
++    GUID current_subtype;
++    UINT64 frame_size;
++    UINT32 image_size;
++    LONG stride;
++    HRESULT hr;
++
++    if (FAILED(hr = MFCreateMediaType(&media_type)))
++        return hr;
++
++    if (base_type && FAILED(hr = IMFMediaType_CopyAllItems(base_type, (IMFAttributes *)media_type)))
++        goto done;
++    if (FAILED(hr = IMFMediaType_SetGUID(media_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)))
++        goto done;
++    if (subtype && FAILED(hr = IMFMediaType_SetGUID(media_type, &MF_MT_SUBTYPE, subtype)))
++        goto done;
++    if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_FIXED_SIZE_SAMPLES, TRUE)))
++        goto done;
++    if (FAILED(hr = IMFMediaType_SetUINT32(media_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE)))
++        goto done;
++
++    if (!subtype)
++    {
++        if (FAILED(hr = IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &current_subtype)))
++            goto done;
++        subtype = &current_subtype;
++    }
++    if (SUCCEEDED(IMFMediaType_GetUINT64(media_type, &MF_MT_FRAME_SIZE, &frame_size)))
++    {
++        if (SUCCEEDED(MFGetStrideForBitmapInfoHeader(subtype->Data1, frame_size >> 32, &stride)))
++            IMFMediaType_SetUINT32(media_type, &MF_MT_DEFAULT_STRIDE, abs(stride));
++        if (SUCCEEDED(MFCalculateImageSize(subtype, frame_size >> 32, (UINT32)frame_size, &image_size)))
++            IMFMediaType_SetUINT32(media_type, &MF_MT_SAMPLE_SIZE, image_size);
++    }
++
++    if (FAILED(hr = MFCreateAMMediaTypeFromMFMediaType(media_type, GUID_NULL, &am_type)))
++        goto done;
++
++    *dmo_type = *(DMO_MEDIA_TYPE *)am_type;
++    CoTaskMemFree(am_type);
++
++done:
++    IMFMediaType_Release(media_type);
++    return hr;
++}
++
++static HRESULT create_mf_media_type(const DMO_MEDIA_TYPE *dmo_type, IMFMediaType **media_type)
++{
++    return MFCreateMediaTypeFromRepresentation(AM_MEDIA_TYPE_REPRESENTATION,
++            (void *)dmo_type, media_type);
++}
++
+ static HRESULT WINAPI media_object_GetStreamCount(IMediaObject *iface, DWORD *input, DWORD *output)
+ {
+-    FIXME("iface %p, input %p, output %p stub!\n", iface, input, output);
+-    return E_NOTIMPL;
++    TRACE("iface %p, input %p, output %p.\n", iface, input, output);
++    if (!input || !output) return E_POINTER;
++    *input = *output = 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputStreamInfo(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags) return E_POINTER;
++    *flags = DMO_INPUT_STREAMF_WHOLE_SAMPLES | DMO_INPUT_STREAMF_SINGLE_SAMPLE_PER_BUFFER
++            | DMO_INPUT_STREAMF_FIXED_SAMPLE_SIZE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetOutputStreamInfo(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags) return E_POINTER;
++    *flags = DMO_OUTPUT_STREAMF_WHOLE_SAMPLES | DMO_OUTPUT_STREAMF_SINGLE_SAMPLE_PER_BUFFER
++            | DMO_OUTPUT_STREAMF_FIXED_SAMPLE_SIZE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputType(IMediaObject *iface, DWORD index, DWORD type_index,
+         DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type_index %lu, type %p stub!\n", iface, index, type_index, type);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, type_index %lu, type %p.\n", iface, index, type_index, type);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (type_index >= ARRAY_SIZE(input_types)) return DMO_E_NO_MORE_ITEMS;
++    if (!type) return S_OK;
++    return create_dmo_media_type(impl->input_type, input_types[type_index], type);
+ }
+ 
+ static HRESULT WINAPI media_object_GetOutputType(IMediaObject *iface, DWORD index, DWORD type_index,
+         DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type_index %lu, type %p stub!\n", iface, index, type_index, type);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, type_index %lu, type %p.\n", iface, index, type_index, type);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (type_index >= ARRAY_SIZE(output_types)) return DMO_E_NO_MORE_ITEMS;
++    if (!type) return S_OK;
++    return create_dmo_media_type(impl->input_type, output_types[type_index], type);
+ }
+ 
+ static HRESULT WINAPI media_object_SetInputType(IMediaObject *iface, DWORD index,
+         const DMO_MEDIA_TYPE *type, DWORD flags)
+ {
+-    FIXME("iface %p, index %lu, type %p, flags %#lx stub!\n", iface, index, type, flags);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    IMFMediaType *media_type = NULL;
++    HRESULT hr;
++    TRACE("iface %p, index %lu, type %p, flags %#lx.\n", iface, index, type, flags);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!type)
++    {
++        if (!(flags & DMO_SET_TYPEF_CLEAR)) return E_POINTER;
++        return transform_SetInputType(&impl->IMFTransform_iface, 0, NULL, 0);
++    }
++    if (FAILED(create_mf_media_type(type, &media_type))) return DMO_E_TYPE_NOT_ACCEPTED;
++    hr = transform_SetInputType(&impl->IMFTransform_iface, 0, media_type,
++            flags & DMO_SET_TYPEF_TEST_ONLY ? MFT_SET_TYPE_TEST_ONLY : 0);
++    IMFMediaType_Release(media_type);
++    return SUCCEEDED(hr) ? hr : DMO_E_TYPE_NOT_ACCEPTED;
+ }
+ 
+ static HRESULT WINAPI media_object_SetOutputType(IMediaObject *iface, DWORD index,
+         const DMO_MEDIA_TYPE *type, DWORD flags)
+ {
+-    FIXME("iface %p, index %lu, type %p, flags %#lx stub!\n", iface, index, type, flags);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    IMFMediaType *media_type = NULL;
++    HRESULT hr;
++    TRACE("iface %p, index %lu, type %p, flags %#lx.\n", iface, index, type, flags);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!type)
++    {
++        if (!(flags & DMO_SET_TYPEF_CLEAR)) return E_POINTER;
++        return transform_SetOutputType(&impl->IMFTransform_iface, 0, NULL, 0);
++    }
++    if (FAILED(create_mf_media_type(type, &media_type))) return DMO_E_TYPE_NOT_ACCEPTED;
++    hr = transform_SetOutputType(&impl->IMFTransform_iface, 0, media_type,
++            flags & DMO_SET_TYPEF_TEST_ONLY ? MFT_SET_TYPE_TEST_ONLY : 0);
++    IMFMediaType_Release(media_type);
++    return SUCCEEDED(hr) ? hr : DMO_E_TYPE_NOT_ACCEPTED;
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputCurrentType(IMediaObject *iface, DWORD index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type %p stub!\n", iface, index, type);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, type %p.\n", iface, index, type);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!type) return E_POINTER;
++    if (!impl->input_type) return DMO_E_TYPE_NOT_SET;
++    return create_dmo_media_type(impl->input_type, NULL, type);
+ }
+ 
+ static HRESULT WINAPI media_object_GetOutputCurrentType(IMediaObject *iface, DWORD index, DMO_MEDIA_TYPE *type)
+ {
+-    FIXME("iface %p, index %lu, type %p stub!\n", iface, index, type);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, type %p.\n", iface, index, type);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!type) return E_POINTER;
++    if (!impl->output_type) return DMO_E_TYPE_NOT_SET;
++    return create_dmo_media_type(impl->output_type, NULL, type);
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputSizeInfo(IMediaObject *iface, DWORD index, DWORD *size,
+         DWORD *lookahead, DWORD *alignment)
+ {
+-    FIXME("iface %p, index %lu, size %p, lookahead %p, alignment %p stub!\n", iface, index, size,
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, size %p, lookahead %p, alignment %p.\n", iface, index, size,
+             lookahead, alignment);
+-    return E_NOTIMPL;
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!size || !lookahead || !alignment) return E_POINTER;
++    if (!impl->input_type) return DMO_E_TYPE_NOT_SET;
++    *size = impl->input_info.cbSize;
++    *lookahead = 0;
++    *alignment = impl->input_info.cbAlignment;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetOutputSizeInfo(IMediaObject *iface, DWORD index, DWORD *size, DWORD *alignment)
+ {
+-    FIXME("iface %p, index %lu, size %p, alignment %p stub!\n", iface, index, size, alignment);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p, index %lu, size %p, alignment %p.\n", iface, index, size, alignment);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!size || !alignment) return E_POINTER;
++    if (!impl->output_type) return DMO_E_TYPE_NOT_SET;
++    *size = impl->output_info.cbSize;
++    *alignment = impl->output_info.cbAlignment;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputMaxLatency(IMediaObject *iface, DWORD index, REFERENCE_TIME *latency)
+@@ -892,53 +1021,112 @@ static HRESULT WINAPI media_object_SetInputMaxLatency(IMediaObject *iface, DWORD
+ 
+ static HRESULT WINAPI media_object_Flush(IMediaObject *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    TRACE("iface %p.\n", iface);
++    if (!impl->winedmo_transform.handle) return S_OK;
++    return winedmo_transform_flush(impl->winedmo_transform) ? E_FAIL : S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_Discontinuity(IMediaObject *iface, DWORD index)
+ {
+-    FIXME("iface %p, index %lu stub!\n", iface, index);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu.\n", iface, index);
++    return index ? DMO_E_INVALIDSTREAMINDEX : S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_AllocateStreamingResources(IMediaObject *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_FreeStreamingResources(IMediaObject *iface)
+ {
+-    FIXME("iface %p stub!\n", iface);
+-    return E_NOTIMPL;
++    TRACE("iface %p.\n", iface);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_GetInputStatus(IMediaObject *iface, DWORD index, DWORD *flags)
+ {
+-    FIXME("iface %p, index %lu, flags %p stub!\n", iface, index, flags);
+-    return E_NOTIMPL;
++    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!flags) return E_POINTER;
++    *flags = DMO_INPUT_STATUSF_ACCEPT_DATA;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_ProcessInput(IMediaObject *iface, DWORD index,
+         IMediaBuffer *buffer, DWORD flags, REFERENCE_TIME timestamp, REFERENCE_TIME timelength)
+ {
+-    FIXME("iface %p, index %lu, buffer %p, flags %#lx, timestamp %s, timelength %s stub!\n", iface,
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    DWORD push_flags = 0, size;
++    NTSTATUS status;
++    BYTE *data;
++    HRESULT hr;
++    TRACE("iface %p, index %lu, buffer %p, flags %#lx, timestamp %s, timelength %s.\n", iface,
+             index, buffer, flags, wine_dbgstr_longlong(timestamp), wine_dbgstr_longlong(timelength));
+-    return E_NOTIMPL;
++    if (index) return DMO_E_INVALIDSTREAMINDEX;
++    if (!buffer) return E_POINTER;
++    if (!impl->winedmo_transform.handle) return DMO_E_TYPE_NOT_SET;
++    if (FAILED(hr = IMediaBuffer_GetBufferAndLength(buffer, &data, &size))) return hr;
++    if (flags & DMO_INPUT_DATA_BUFFERF_SYNCPOINT) push_flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
++    if (flags & DMO_INPUT_DATA_BUFFERF_DISCONTINUITY) push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++    status = winedmo_transform_push_input(impl->winedmo_transform, data, size,
++            flags & DMO_INPUT_DATA_BUFFERF_TIME ? timestamp : INT64_MIN, INT64_MIN,
++            flags & DMO_INPUT_DATA_BUFFERF_TIMELENGTH ? timelength : INT64_MIN, push_flags);
++    if (status == STATUS_DEVICE_BUSY) return S_FALSE;
++    return status ? E_FAIL : S_OK;
+ }
+ 
+ static HRESULT WINAPI media_object_ProcessOutput(IMediaObject *iface, DWORD flags, DWORD count,
+         DMO_OUTPUT_DATA_BUFFER *buffers, DWORD *status)
+ {
+-    FIXME("iface %p, flags %#lx, count %lu, buffers %p, status %p stub!\n", iface, flags, count, buffers, status);
+-    return E_NOTIMPL;
++    struct color_convert *impl = impl_from_IMediaObject(iface);
++    INT64 out_pts, out_dur;
++    DWORD out_flags, max_size;
++    IMediaBuffer *buffer;
++    NTSTATUS nt_status;
++    UINT32 out_size;
++    BYTE *data;
++    HRESULT hr;
++    TRACE("iface %p, flags %#lx, count %lu, buffers %p, status %p.\n", iface, flags, count, buffers, status);
++    if (count != 1 || !buffers || !status) return E_INVALIDARG;
++    if (!impl->winedmo_transform.handle) return DMO_E_TYPE_NOT_SET;
++    *status = buffers[0].dwStatus = 0;
++    if (!(buffer = buffers[0].pBuffer))
++        return flags & DMO_PROCESS_OUTPUT_DISCARD_WHEN_NO_BUFFER ? S_FALSE : E_INVALIDARG;
++    if (FAILED(hr = IMediaBuffer_GetMaxLength(buffer, &max_size))) return hr;
++    if (FAILED(hr = IMediaBuffer_GetBufferAndLength(buffer, &data, NULL))) return hr;
++retry:
++    out_size = max_size;
++    nt_status = winedmo_transform_get_output(impl->winedmo_transform, data, &out_size,
++            &out_pts, &out_dur, &out_flags);
++    if (!nt_status)
++    {
++        if (out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED) goto retry;
++        if (FAILED(hr = IMediaBuffer_SetLength(buffer, out_size))) return hr;
++        buffers[0].dwStatus = DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT;
++        if (out_pts != INT64_MIN)
++        {
++            buffers[0].rtTimestamp = out_pts;
++            buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_TIME;
++        }
++        if (out_dur != INT64_MIN)
++        {
++            buffers[0].rtTimelength = out_dur;
++            buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH;
++        }
++        if (out_flags & WINEDMO_SAMPLE_FLAG_INCOMPLETE)
++            buffers[0].dwStatus |= DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE;
++        return S_OK;
++    }
++    if (nt_status == STATUS_MORE_PROCESSING_REQUIRED || nt_status == STATUS_END_OF_FILE) return S_FALSE;
++    return E_FAIL;
+ }
+ 
+ static HRESULT WINAPI media_object_Lock(IMediaObject *iface, LONG lock)
+ {
+-    FIXME("iface %p, lock %ld stub!\n", iface, lock);
+-    return E_NOTIMPL;
++    TRACE("iface %p, lock %ld.\n", iface, lock);
++    return S_OK;
+ }
+ 
+ static const IMediaObjectVtbl media_object_vtbl =
+-- 
+2.54.0
+
+
