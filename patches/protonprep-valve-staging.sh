@@ -318,6 +318,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
+    echo "WINE: -SWITCHVN- Apply SwitchVN compatibility patches"
+    apply_all_in_dir "../patches/switchvn/"
+
     # https://github.com/xzn/proton-ds5-haptic
     echo "WINE: -HOTFIX- Add proton DS5 patches"
     for patch in ../patches/proton-ds5-haptic/*.patch; do

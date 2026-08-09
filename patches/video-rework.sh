@@ -36,6 +36,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
+    echo "WINE: -SWITCHVN- Apply SwitchVN compatibility patches"
+    apply_all_in_dir "../patches/switchvn/"
+
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

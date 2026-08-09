@@ -187,4 +187,3 @@ index 6f5c0a0134..8bbadcb224 100644
      video_format->bmiHeader.biHeight = height;
 -- 
 2.54.0
-
