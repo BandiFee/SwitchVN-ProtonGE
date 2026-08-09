@@ -326,8 +326,9 @@ apply_all_in_dir() {
 
     if ! grep -Fq "CLSID_Colour" dlls/qasf/qasf_main.c \
             || ! grep -Fq "mpeg_video_codec_get_sequence_format" dlls/winedmo/quartz_transform.c \
-            || ! grep -Fq "!format->bmiHeader.biWidth || !format->bmiHeader.biHeight" dlls/winedmo/quartz_transform.c; then
-        echo "FAILED: SwitchVN video patch sentinel is missing" >&2
+            || ! grep -Fq "!format->bmiHeader.biWidth || !format->bmiHeader.biHeight" dlls/winedmo/quartz_transform.c \
+            || ! grep -Fq "mpeg1_wave_format_from_codec_params" dlls/winedmo/unix_media_type.c; then
+        echo "FAILED: SwitchVN DirectShow patch sentinel is missing" >&2
         exit 1
     fi
 

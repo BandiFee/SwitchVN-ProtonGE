@@ -10,4 +10,5 @@ filename order.
 - `0024-directshow-stream-shutdown-lifecycle.patch`:
   DMO wrapper and WM reader allocator lifecycle fixes for safe video stop/skip.
 - `0025-directshow-colour-mpeg-video-compatibility.patch`:
-  `CLSID_Colour`, MPEG format recovery, and concrete downstream type negotiation.
+  `CLSID_Colour`, MPEG video format recovery, concrete downstream type
+  negotiation, and complete MP1/MP2 DirectShow audio media types.
