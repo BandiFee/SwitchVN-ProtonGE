@@ -116,6 +116,7 @@ jobs:
           check wine/dlls/qasf/qasf_main.c        "CLSID_Colour"                    "DirectShow color converter registration"
           check wine/dlls/qasf/qasf_classes.idl   "1643e180-90f5-11ce-97d5-00aa0055595a" "color converter COM registry"
           check wine/dlls/winedmo/color_convert.c "create_dmo_media_type"           "color converter DMO adapter"
+          check wine/dlls/winedmo/quartz_transform.c "mpeg_video_codec_get_sequence_format" "MPEG sequence-header format recovery"
           # Not a patch but part of the same fix set, and it has been dropped by
           # a branch rewrite once already.
           # Match the condition, not just the option name: upstream already has
