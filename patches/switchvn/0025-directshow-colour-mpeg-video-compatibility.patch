@@ -1,18 +1,17 @@
-From 793ccc847bf57822154b08221a2bf89cef3312c0 Mon Sep 17 00:00:00 2001
-From: SwitchVN contributors <switchvn@local>
-Date: Sun, 9 Aug 2026 10:57:00 +0800
-Subject: [PATCH] qasf: Expose the DirectShow color space converter
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BandiFee <bandifee@gmail.com>
+Date: Sun, 9 Aug 2026 18:42:00 +0800
+Subject: [PATCH] qasf/winedmo: Add DirectShow Colour MPEG compatibility
 
-Register CLSID_Colour as a qasf DMO wrapper around the private winedmo color converter, and implement the converter IMediaObject adapter required by DirectShow.
+Expose CLSID_Colour through the qasf DMO wrapper and make the MPEG video
+path negotiate concrete output media types with it. Recover dimensions and
+frame duration from MPEG sequence headers when container metadata is empty,
+then reject generic zero-size downstream types so they cannot overwrite the
+decoder-provided format before VMR9 allocates its surfaces.
+
+Together these changes implement the complete MPEG decoder -> Colour -> VMR9
+compatibility path required by older DirectShow games.
 ---
- dlls/qasf/dmowrapper.c       |  37 ++++-
- dlls/qasf/qasf_classes.idl   |   7 +
- dlls/qasf/qasf_main.c        |   3 +
- dlls/qasf/qasf_private.h     |   1 +
- dlls/qasf/tests/dmowrapper.c | 166 ++++++++++++++++++++++
- dlls/winedmo/color_convert.c | 264 ++++++++++++++++++++++++++++++-----
- 6 files changed, 437 insertions(+), 41 deletions(-)
-
 diff --git a/dlls/qasf/dmowrapper.c b/dlls/qasf/dmowrapper.c
 index 301b05899e..26e225cb7b 100644
 --- a/dlls/qasf/dmowrapper.c
@@ -695,6 +694,227 @@ index 09c7e9515a..13427ceb76 100644
  }
  
  static const IMediaObjectVtbl media_object_vtbl =
+diff --git a/dlls/quartz/tests/mpegvideo.c b/dlls/quartz/tests/mpegvideo.c
+index d5e8a1c30d..fd5f19cb82 100644
+--- a/dlls/quartz/tests/mpegvideo.c
++++ b/dlls/quartz/tests/mpegvideo.c
+@@ -2095,6 +2095,62 @@ static void test_connect_pin(void)
+     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+ }
+ 
++static void test_sequence_header_format(void)
++{
++    IBaseFilter *filter = create_mpeg_video_codec();
++    MPEG1VIDEOINFO_12 format = mpg_format;
++    struct testfilter testsource;
++    AM_MEDIA_TYPE mt = mpeg_mt, *output_mt;
++    IEnumMediaTypes *enummt;
++    IFilterGraph2 *graph;
++    VIDEOINFOHEADER *vih;
++    IPin *sink, *source;
++    HRESULT hr;
++    ULONG ref;
++
++    memset(&format.hdr.rcSource, 0, sizeof(format.hdr.rcSource));
++    format.hdr.AvgTimePerFrame = 0;
++    format.hdr.bmiHeader.biWidth = 0;
++    format.hdr.bmiHeader.biHeight = 0;
++    mt.pbFormat = (BYTE *)&format;
++
++    CoCreateInstance(&CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IFilterGraph2, (void **)&graph);
++    testfilter_init(&testsource);
++    IFilterGraph2_AddFilter(graph, &testsource.filter.IBaseFilter_iface, L"source");
++    IFilterGraph2_AddFilter(graph, filter, L"MPEG video decoder");
++    IBaseFilter_FindPin(filter, L"In", &sink);
++    IBaseFilter_FindPin(filter, L"Out", &source);
++
++    hr = IFilterGraph2_ConnectDirect(graph, &testsource.source.pin.IPin_iface, sink, &mt);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    hr = IPin_EnumMediaTypes(source, &enummt);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IEnumMediaTypes_Next(enummt, 1, &output_mt, NULL);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    vih = (VIDEOINFOHEADER *)output_mt->pbFormat;
++    ok(vih->bmiHeader.biWidth == 32, "Got width %ld.\n", vih->bmiHeader.biWidth);
++    ok(vih->bmiHeader.biHeight == 24, "Got height %ld.\n", vih->bmiHeader.biHeight);
++    ok(vih->AvgTimePerFrame == 400000, "Got frame duration %s.\n",
++            wine_dbgstr_longlong(vih->AvgTimePerFrame));
++    ok(vih->bmiHeader.biSizeImage == 32 * 24 * 3 / 2, "Got image size %lu.\n",
++            vih->bmiHeader.biSizeImage);
++    DeleteMediaType(output_mt);
++    IEnumMediaTypes_Release(enummt);
++
++    IFilterGraph2_Disconnect(graph, sink);
++    IFilterGraph2_Disconnect(graph, &testsource.source.pin.IPin_iface);
++    IPin_Release(sink);
++    IPin_Release(source);
++    ref = IFilterGraph2_Release(graph);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ref = IBaseFilter_Release(filter);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ref = IBaseFilter_Release(&testsource.filter.IBaseFilter_iface);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++}
++
+ START_TEST(mpegvideo)
+ {
+     IBaseFilter *filter;
+@@ -2117,6 +2173,7 @@ START_TEST(mpegvideo)
+     test_pin_info();
+     test_enum_media_types();
+     test_media_types();
++    test_sequence_header_format();
+     test_connect_pin();
+ 
+     CoUninitialize();
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 6f5c0a0134..8bbadcb224 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -1036,6 +1036,56 @@ static HRESULT mpeg_video_codec_source_query_accept(struct transform *filter, co
+     return S_OK;
+ }
+ 
++static BOOL mpeg_video_codec_get_sequence_format(const AM_MEDIA_TYPE *mt, LONG *width, LONG *height,
++        REFERENCE_TIME *frame_duration)
++{
++    static const struct
++    {
++        UINT numerator;
++        UINT denominator;
++    } frame_rates[] =
++    {
++        {0, 1},
++        {24000, 1001},
++        {24, 1},
++        {25, 1},
++        {30000, 1001},
++        {30, 1},
++        {50, 1},
++        {60000, 1001},
++        {60, 1},
++    };
++    const MPEG1VIDEOINFO *format;
++    DWORD sequence_size, i;
++
++    if (!IsEqualGUID(&mt->formattype, &FORMAT_MPEGVideo)
++            || mt->cbFormat < offsetof(MPEG1VIDEOINFO, bSequenceHeader) || !mt->pbFormat)
++        return FALSE;
++
++    format = (const MPEG1VIDEOINFO *)mt->pbFormat;
++    sequence_size = min(format->cbSequenceHeader,
++            mt->cbFormat - offsetof(MPEG1VIDEOINFO, bSequenceHeader));
++
++    for (i = 0; i + 7 < sequence_size; ++i)
++    {
++        UINT frame_rate_code;
++
++        if (format->bSequenceHeader[i] || format->bSequenceHeader[i + 1]
++                || format->bSequenceHeader[i + 2] != 1 || format->bSequenceHeader[i + 3] != 0xb3)
++            continue;
++
++        *width = (format->bSequenceHeader[i + 4] << 4) | (format->bSequenceHeader[i + 5] >> 4);
++        *height = ((format->bSequenceHeader[i + 5] & 0x0f) << 8) | format->bSequenceHeader[i + 6];
++        frame_rate_code = format->bSequenceHeader[i + 7] & 0x0f;
++        if (frame_rate_code < ARRAY_SIZE(frame_rates) && frame_rates[frame_rate_code].numerator)
++            *frame_duration = MulDiv(10000000, frame_rates[frame_rate_code].denominator,
++                    frame_rates[frame_rate_code].numerator);
++        return *width && *height;
++    }
++
++    return FALSE;
++}
++
+ static HRESULT mpeg_video_codec_source_get_media_type(struct transform *filter, unsigned int index, AM_MEDIA_TYPE *mt)
+ {
+     static const struct
+@@ -1056,6 +1106,7 @@ static HRESULT mpeg_video_codec_source_get_media_type(struct transform *filter,
+ 
+     const VIDEOINFOHEADER *input_format = (const VIDEOINFOHEADER *)filter->sink.pin.mt.pbFormat;
+     VIDEOINFOHEADER *video_format;
++    REFERENCE_TIME frame_duration;
+     LONG width, height, stride, image_size;
+ 
+     if (!filter->sink.pin.peer)
+@@ -1066,6 +1117,20 @@ static HRESULT mpeg_video_codec_source_get_media_type(struct transform *filter,
+ 
+     width = input_format->bmiHeader.biWidth;
+     height = abs(input_format->bmiHeader.biHeight);
++    frame_duration = input_format->AvgTimePerFrame;
++    if (!width || !height || !frame_duration)
++    {
++        LONG sequence_width = 0, sequence_height = 0;
++        REFERENCE_TIME sequence_duration = 0;
++
++        if (mpeg_video_codec_get_sequence_format(&filter->sink.pin.mt, &sequence_width,
++                &sequence_height, &sequence_duration))
++        {
++            if (!width) width = sequence_width;
++            if (!height) height = sequence_height;
++            if (!frame_duration) frame_duration = sequence_duration;
++        }
++    }
+ 
+     if (formats[index].compression == MAKEFOURCC('Y','V','1','2'))
+         image_size = width * height * 3 / 2;
+@@ -1080,7 +1145,7 @@ static HRESULT mpeg_video_codec_source_get_media_type(struct transform *filter,
+         return E_OUTOFMEMORY;
+ 
+     memset(video_format, 0, sizeof(*video_format));
+-    video_format->AvgTimePerFrame = input_format->AvgTimePerFrame;
++    video_format->AvgTimePerFrame = frame_duration;
+     video_format->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+     video_format->bmiHeader.biWidth = width;
+     video_format->bmiHeader.biHeight = height;
+diff --git a/dlls/quartz/tests/mpegvideo.c b/dlls/quartz/tests/mpegvideo.c
+index fd5f19cb82..919f48ac07 100644
+--- a/dlls/quartz/tests/mpegvideo.c
++++ b/dlls/quartz/tests/mpegvideo.c
+@@ -1870,6 +1870,20 @@ static void test_connect_pin(void)
+     hr = IPin_QueryAccept(source, &yuy2_mt);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
++    req_mt = yuy2_mt;
++    req_format = yuy2_format;
++    req_mt.pbFormat = (BYTE *)&req_format;
++    req_format.bmiHeader.biWidth = 0;
++    hr = IPin_QueryAccept(source, &req_mt);
++    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++
++    req_mt = yuy2_mt;
++    req_format = yuy2_format;
++    req_mt.pbFormat = (BYTE *)&req_format;
++    req_format.bmiHeader.biHeight = 0;
++    hr = IPin_QueryAccept(source, &req_mt);
++    ok(hr == S_FALSE, "Got hr %#lx.\n", hr);
++
+     req_mt = yuy2_mt;
+     req_mt.majortype = GUID_NULL;
+     hr = IPin_QueryAccept(source, &req_mt);
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 8bbadcb224..3858a64cf1 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -1022,6 +1022,7 @@ static HRESULT mpeg_video_codec_sink_query_accept(struct transform *filter, cons
+ 
+ static HRESULT mpeg_video_codec_source_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
+ {
++    const VIDEOINFOHEADER *format;
+     if (!filter->sink.pin.peer)
+         return S_FALSE;
+ 
+@@ -1030,6 +1031,10 @@ static HRESULT mpeg_video_codec_source_query_accept(struct transform *filter, co
+             || mt->cbFormat < sizeof(VIDEOINFOHEADER))
+         return S_FALSE;
+ 
++    format = (const VIDEOINFOHEADER *)mt->pbFormat;
++    if (!format->bmiHeader.biWidth || !format->bmiHeader.biHeight)
++        return S_FALSE;
++
+     if (!IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_YV12)
+             /* missing: MEDIASUBTYPE_Y41P, not supported by winedmo */
+             && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_YUY2)
 -- 
 2.54.0
-

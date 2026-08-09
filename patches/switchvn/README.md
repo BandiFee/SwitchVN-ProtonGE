@@ -5,9 +5,9 @@ from the upstream GE video-rework series. The preparation scripts apply the
 complete `ge-video-rework` directory first, then apply this directory in
 filename order.
 
-- `0023`: Tegra envideo hardware video decoding.
-- `0024`: qasf DMO wrapper allocator decommit lock ordering.
-- `0025`: WM reader decommitted allocator end-of-stream handling.
-- `0026`: DirectShow `CLSID_Colour` converter compatibility.
-- `0027`: MPEG sequence-header recovery for zero-size video formats.
-- `0028`: Reject zero-size MPEG output types during downstream negotiation.
+- `0023-winedmo-envideo-hardware-video-decoding.patch`:
+  Tegra envideo hardware video decoding.
+- `0024-directshow-stream-shutdown-lifecycle.patch`:
+  DMO wrapper and WM reader allocator lifecycle fixes for safe video stop/skip.
+- `0025-directshow-colour-mpeg-video-compatibility.patch`:
+  `CLSID_Colour`, MPEG format recovery, and concrete downstream type negotiation.

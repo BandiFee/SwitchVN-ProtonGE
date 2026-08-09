@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Sat, 1 Aug 2026 00:00:00 +0800
+Subject: [PATCH] qasf/winedmo: Fix DirectShow stream shutdown races
+
+Stopping or skipping video can race decoder output allocation against graph
+shutdown. Decommit DMO wrapper output allocators before taking the streaming
+lock, and treat a concurrently decommitted WM reader allocator as normal end
+of stream instead of raising EC_ERRORABORT.
+
+These are the two sides of the same allocator lifecycle race observed when
+skipping ATRI opening videos.
+---
+diff --git a/dlls/qasf/dmowrapper.c b/dlls/qasf/dmowrapper.c
+index 1111111111..2222222222 100644
+--- a/dlls/qasf/dmowrapper.c
++++ b/dlls/qasf/dmowrapper.c
+@@ -950,13 +950,19 @@
+ 
+     IUnknown_QueryInterface(filter->dmo, &IID_IMediaObject, (void **)&dmo);
+ 
+-    EnterCriticalSection(&filter->filter.stream_cs);
++    /* Decommit the output allocators before taking the streaming lock.
++     * process_output() blocks in IMemAllocator_GetBuffer() when downstream
++     * holds every buffer, and it does so from Receive(), which strmbase calls
++     * with the streaming lock held.  Decommitting is what makes that call
++     * fail and release the lock, so it has to happen first or the two sides
++     * wait for each other forever. */
+     for (i = 0; i < filter->source_count; ++i)
+     {
+         if (filter->sources[i].pin.pin.peer)
+             IMemAllocator_Decommit(filter->sources[i].pin.pAllocator);
+     }
+ 
++    EnterCriticalSection(&filter->filter.stream_cs);
+     IMediaObject_Flush(dmo);
+     IMediaObject_FreeStreamingResources(dmo);
+ 
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index 1111111111..2222222222 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -2417,9 +2417,20 @@
+ 
+     if (FAILED(hr = wm_stream_allocate_sample(stream, capacity, sample)))
+     {
+-        ERR("Failed to allocate sample of %lu bytes, hr %#lx.\n", capacity, hr);
+         free(stream->current_data);
+         stream->current_data = NULL;
++
++        /* The allocator is decommitted while the graph is being stopped, which
++         * races with this thread still pulling samples.  That is not a failure:
++         * report it as the end of the stream so callers wind down quietly
++         * instead of raising EC_ERRORABORT at the application. */
++        if (hr == VFW_E_NOT_COMMITTED)
++        {
++            TRACE("Allocator is no longer committed, treating as end of stream.\n");
++            return NS_E_NO_MORE_SAMPLES;
++        }
++
++        ERR("Failed to allocate sample of %lu bytes, hr %#lx.\n", capacity, hr);
+         return hr;
+     }
+ 
+-- 
+2.54.0
