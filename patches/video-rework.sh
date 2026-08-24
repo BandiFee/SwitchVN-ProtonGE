@@ -1,9 +1,15 @@
 #!/bin/bash
 
+if command -v gpatch >/dev/null 2>&1; then
+    PATCH_TOOL=gpatch
+else
+    PATCH_TOOL=patch
+fi
+
 # patch functions
 apply_patch() {
     local patch_path="$1"
-    if ! patch --batch -Np1 < "$patch_path"; then
+    if ! "$PATCH_TOOL" --batch -Np1 < "$patch_path"; then
         echo "FAILED to apply $patch_path" >&2
         exit 1
     fi
@@ -28,6 +34,12 @@ apply_all_in_dir() {
     echo "WINE: -WINEOPENXR- copy files into wine"
     mkdir -p dlls/wineopenxr
     cp -R ../wineopenxr/* dlls/wineopenxr/
+
+    # The 11-5 video-rework patch expects this Wine-Wayland change to have
+    # landed first. The full protonprep script applies the complete series;
+    # this standalone validation path needs the one overlapping patch too.
+    echo "WINE: -WINE-WAYLAND- Do not force the X11 GStreamer display type"
+    apply_patch "../patches/wine-hotfixes/wine-wayland/0134-winegstreamer-Don-t-force-x11-display-type.patch"
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
 

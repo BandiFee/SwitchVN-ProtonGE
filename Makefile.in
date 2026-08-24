@@ -29,7 +29,7 @@ TARGET_ARCH ?= x86_64
 ifeq ($(TARGET_ARCH),x86_64)
 	STEAMRT_IMAGE ?= registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64:4.0.20260331.220802-0
 else ifeq ($(TARGET_ARCH),arm64)
-	STEAMRT_IMAGE ?= registry.gitlab.steamos.cloud/proton/steamrt4/sdk/arm64-llvm:4.0.20260331.220802-2
+	STEAMRT_IMAGE ?= registry.gitlab.steamos.cloud/proton/steamrt4/sdk/arm64-llvm:4.0.20260331.220802-3
 else
 	ARCHS := $(error Unknown TARGET_ARCH=$(TARGET_ARCH))
 endif
@@ -296,6 +296,54 @@ $(OBJ)/.bzip2-%-build:
 	cp -a "$(BZIP2_$*_OBJ)/bzlib.h" "$(BZIP2_$*_INCDIR)/"
 	touch $@
 
+##
+## PipeWire ALSA PCM plugin
+##
+
+$(eval $(call rules-source,pipewire-alsa,$(SRCDIR)/pipewire/pipewire-alsa/alsa-plugins))
+$(eval $(call create-rules-common,pipewire-alsa,PIPEWIRE_ALSA,x86_64,unix))
+$(eval $(call create-rules-common,pipewire-alsa,PIPEWIRE_ALSA,aarch64,unix))
+
+$(OBJ)/.pipewire-alsa-post-source:
+	patch -d "$(PIPEWIRE_ALSA_SRC)" -Np1 -i "$(realpath $(SRCDIR)/patches/pipewire/0001-alsa-pcm-support-aux-channel-map.patch)"
+	touch $@
+
+$(OBJ)/.pipewire-alsa-x86_64-configure:
+	@echo ":: configuring pipewire-alsa-x86_64..." >&2
+	touch $@
+
+$(OBJ)/.pipewire-alsa-aarch64-configure:
+	@echo ":: configuring pipewire-alsa-aarch64..." >&2
+	touch $@
+
+$(OBJ)/.pipewire-alsa-x86_64-build:
+	@echo ":: building pipewire-alsa-x86_64..." >&2
+	mkdir -p "$(PIPEWIRE_ALSA_x86_64_LIBDIR)/$(x86_64-unix_LIBDIR)/alsa-lib"
+	env $(PIPEWIRE_ALSA_x86_64_ENV) \
+	    "$(x86_64-unix_TARGET)-gcc" -shared -fPIC -DPIC \
+	    $$("$(x86_64-unix_TARGET)-pkg-config" --cflags alsa libpipewire-0.3 libspa-0.2) \
+	    $(x86_64_CFLAGS) $(CFLAGS) \
+	    -Wl,-soname,libasound_module_pcm_pipewire.so \
+	    -o "$(PIPEWIRE_ALSA_x86_64_LIBDIR)/$(x86_64-unix_LIBDIR)/alsa-lib/libasound_module_pcm_pipewire.so" \
+	    "$(PIPEWIRE_ALSA_SRC)/pcm_pipewire.c" \
+	    $$("$(x86_64-unix_TARGET)-pkg-config" --libs alsa libpipewire-0.3 libspa-0.2) \
+	    $(x86_64_LDFLAGS) $(LDFLAGS)
+	touch $@
+
+$(OBJ)/.pipewire-alsa-aarch64-build:
+	@echo ":: building pipewire-alsa-aarch64..." >&2
+	mkdir -p "$(PIPEWIRE_ALSA_aarch64_LIBDIR)/$(aarch64-unix_LIBDIR)/alsa-lib"
+	env $(PIPEWIRE_ALSA_aarch64_ENV) \
+	    "$(aarch64-unix_TARGET)-gcc" -shared -fPIC -DPIC \
+	    $$("$(aarch64-unix_TARGET)-pkg-config" --cflags alsa libpipewire-0.3 libspa-0.2) \
+	    $(aarch64_CFLAGS) $(CFLAGS) \
+	    -Wl,-soname,libasound_module_pcm_pipewire.so \
+	    -o "$(PIPEWIRE_ALSA_aarch64_LIBDIR)/$(aarch64-unix_LIBDIR)/alsa-lib/libasound_module_pcm_pipewire.so" \
+	    "$(PIPEWIRE_ALSA_SRC)/pcm_pipewire.c" \
+	    $$("$(aarch64-unix_TARGET)-pkg-config" --libs alsa libpipewire-0.3 libspa-0.2) \
+	    $(aarch64_LDFLAGS) $(LDFLAGS)
+	touch $@
+
 FFMPEG_DEPENDS = bzip2 dav1d xz
 
 FFMPEG_CONFIGURE_ARGS := \
@@ -404,6 +452,13 @@ $(eval $(call rules-cmake,glslang,aarch64,unix))
 ##
 
 LSTEAMCLIENT_DEPENDS = wine
+
+ifeq ($(TARGET_ARCH),arm64)
+# Wine's ARM64X build installs its PE import libraries under the aarch64 build tree.
+LSTEAMCLIENT_i386_LIBFLAGS = -L$(WINE_aarch64_LIBDIR)/wine/i386-windows
+LSTEAMCLIENT_x86_64_LIBFLAGS = -L$(WINE_aarch64_LIBDIR)/wine/x86_64-windows
+LSTEAMCLIENT_arm64ec_LIBFLAGS = -L$(WINE_aarch64_LIBDIR)/wine/aarch64-windows
+endif
 
 $(eval $(call rules-source,lsteamclient,$(SRCDIR)/lsteamclient))
 $(eval $(call rules-makedep,lsteamclient,i386))
@@ -740,7 +795,9 @@ DXVK_arm64ec_SOURCE_DATE_EPOCH := $(shell expr $(arm64ec_SOURCE_DATE_EPOCH) - 1)
 DXVK_SOURCE_ARGS = \
   --exclude version.h.in \
 
-DXVK_MESON_ARGS = -Db_ndebug=true --force-fallback-for=libdisplay-info
+DXVK_arm64ec_CFLAGS = -marm64x
+DXVK_arm64ec_LDFLAGS = -marm64x
+
 DXVK_i386_MESON_ARGS = --bindir=$(DXVK_i386_DST)/lib/wine/dxvk/i386-windows
 DXVK_x86_64_MESON_ARGS = --bindir=$(DXVK_x86_64_DST)/lib/wine/dxvk/x86_64-windows
 DXVK_arm64ec_MESON_ARGS = --bindir=$(DXVK_arm64ec_DST)/lib/wine/dxvk/aarch64-windows
@@ -892,6 +949,9 @@ VKD3D_PROTON_i386_MESON_ARGS = --bindir=$(VKD3D_PROTON_i386_DST)/lib/wine/vkd3d-
 VKD3D_PROTON_x86_64_MESON_ARGS = --bindir=$(VKD3D_PROTON_x86_64_DST)/lib/wine/vkd3d-proton/x86_64-windows
 VKD3D_PROTON_arm64ec_MESON_ARGS = --bindir=$(VKD3D_PROTON_arm64ec_DST)/lib/wine/vkd3d-proton/aarch64-windows
 VKD3D_PROTON_HOST_DEPENDS = glslang
+
+VKD3D_PROTON_arm64ec_CFLAGS = -marm64x
+VKD3D_PROTON_arm64ec_LDFLAGS = -marm64x
 
 ifneq ($(UNSTRIPPED_BUILD),)
 	VKD3D_PROTON_MESON_ARGS = -Denable_trace=true

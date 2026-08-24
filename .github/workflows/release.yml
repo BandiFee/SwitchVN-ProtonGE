@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build and publish (e.g. GE-Proton11-3-SwitchVN-1)'
+        description: 'Existing tag to build and publish (e.g. GE-Proton11-5-SwitchVN-1)'
         required: true
 
 # A tag push sets ref_name to the tag; a manual run sets it to the branch, so
