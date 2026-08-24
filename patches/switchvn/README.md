@@ -12,3 +12,6 @@ filename order.
 - `0025-directshow-colour-mpeg-video-compatibility.patch`:
   `CLSID_Colour`, MPEG video format recovery, concrete downstream type
   negotiation, and complete MP1/MP2 DirectShow audio media types.
+- `0026-winedmo-hevc-media-foundation-decoder.patch`:
+  Media Foundation H.265/HEVC decoder registration backed by winedmo and
+  envideo.

@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Mon, 24 Aug 2026 00:00:00 +0800
+Subject: [PATCH] winedmo: expose an HEVC Media Foundation decoder
+
+Media Foundation can identify HEVC streams from the winedmo media source,
+but msmpeg2vdec only exposes H.264 and MPEG-4 Part 2 decoder transforms.
+Topology resolution therefore stops before a winedmo transform is created.
+
+Register CLSID_MSH265DecoderMFT for HEVC, HEVC_ES and H265 input subtypes,
+and forward it to a dedicated winedmo decoder class.  The decoder uses the
+same generic winedmo video path as H.264, allowing envideo hardware decoding
+to be selected when available.  Also recognize the HEVC_ES 'HEVS' subtype in
+the Unix transform codec mapping.
+---
+ dlls/msmpeg2vdec/msmpeg2vdec.c   | 16 ++++++++++
+ dlls/msmpeg2vdec/msmpeg2vdec.idl |  6 ++++
+ dlls/winedmo/mfplat.c            |  2 ++
+ dlls/winedmo/unix_transform.c    |  1 +
+ dlls/winedmo/video_decoder.c     | 50 ++++++++++++++++++++++++++++++++
+ dlls/winedmo/winedmo_classes.idl |  6 ++++++
+ dlls/winedmo/winedmo_private.h   |  2 ++
+ dlls/wmvdecod/video_decoder.c    | 18 ++++++++++++
+ dlls/wmvdecod/video_decoder.h    |  1 +
+ 9 files changed, 102 insertions(+)
+
+diff --git a/dlls/wmvdecod/video_decoder.h b/dlls/wmvdecod/video_decoder.h
+--- a/dlls/wmvdecod/video_decoder.h
++++ b/dlls/wmvdecod/video_decoder.h
+@@ -30,6 +30,7 @@
+ #include "wmcodecdsp.h"
+ 
+ extern IClassFactory h264_decoder_factory;
++extern IClassFactory h265_decoder_factory;
+ extern IClassFactory wmv_decoder_factory;
+ 
+ static inline HRESULT WINAPI class_factory_QueryInterface(IClassFactory *iface, REFIID riid, void **out)
+diff --git a/dlls/wmvdecod/video_decoder.c b/dlls/wmvdecod/video_decoder.c
+--- a/dlls/wmvdecod/video_decoder.c
++++ b/dlls/wmvdecod/video_decoder.c
+@@ -42,6 +42,24 @@ static const IClassFactoryVtbl h264_decoder_factory_vtbl =
+ 
+ IClassFactory h264_decoder_factory = {&h264_decoder_factory_vtbl};
+ 
++static HRESULT WINAPI h265_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
++        REFIID riid, void **out)
++{
++    static const GUID CLSID_winedmo_h265_decoder = {0x57d81884,0x432c,0x449d,{0x9c,0x61,0xc8,0xab,0xb4,0xd5,0x95,0x65}};
++    return CoCreateInstance(&CLSID_winedmo_h265_decoder, outer, CLSCTX_INPROC_SERVER, riid, out);
++}
++
++static const IClassFactoryVtbl h265_decoder_factory_vtbl =
++{
++    class_factory_QueryInterface,
++    class_factory_AddRef,
++    class_factory_Release,
++    h265_decoder_factory_CreateInstance,
++    class_factory_LockServer,
++};
++
++IClassFactory h265_decoder_factory = {&h265_decoder_factory_vtbl};
++
+ static HRESULT WINAPI wmv_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
+         REFIID riid, void **out)
+ {
+diff --git a/dlls/msmpeg2vdec/msmpeg2vdec.c b/dlls/msmpeg2vdec/msmpeg2vdec.c
+--- a/dlls/msmpeg2vdec/msmpeg2vdec.c
++++ b/dlls/msmpeg2vdec/msmpeg2vdec.c
+@@ -35,6 +35,9 @@ static const GUID CLSID_MPEG4Part2DecoderMFT = {0x2d709e52, 0x123f, 0x49b5,
+  */
+ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **out)
+ {
++    if (IsEqualGUID(clsid, &CLSID_MSH265DecoderMFT))
++        return IClassFactory_QueryInterface(&h265_decoder_factory, riid, out);
++
+     if (IsEqualGUID(clsid, &CLSID_MSH264DecoderMFT) ||
+             IsEqualGUID(clsid, &CLSID_MPEG4Part2DecoderMFT))
+         return IClassFactory_QueryInterface(&h264_decoder_factory, riid, out);
+@@ -62,6 +65,12 @@ HRESULT WINAPI DllRegisterServer(void)
+         {MFMediaType_Video, MFVideoFormat_I420},
+         {MFMediaType_Video, MFVideoFormat_YUY2},
+     };
++    MFT_REGISTER_TYPE_INFO h265_decoder_mft_inputs[] =
++    {
++        {MFMediaType_Video, MFVideoFormat_HEVC},
++        {MFMediaType_Video, MFVideoFormat_HEVC_ES},
++        {MFMediaType_Video, MFVideoFormat_H265},
++    };
+     DMO_PARTIAL_MEDIATYPE h264_decoder_dmo_inputs[] =
+     {
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_H264},
+@@ -93,6 +102,11 @@ HRESULT WINAPI DllRegisterServer(void)
+             ARRAY_SIZE(h264_decoder_mft_inputs), h264_decoder_mft_inputs,
+             ARRAY_SIZE(h264_decoder_mft_outputs), h264_decoder_mft_outputs, NULL)))
+         return hr;
++    if (FAILED(hr = MFTRegister(CLSID_MSH265DecoderMFT, MFT_CATEGORY_VIDEO_DECODER,
++            (WCHAR *)L"Microsoft H265 Video Decoder MFT", MFT_ENUM_FLAG_SYNCMFT,
++            ARRAY_SIZE(h265_decoder_mft_inputs), h265_decoder_mft_inputs,
++            ARRAY_SIZE(h264_decoder_mft_outputs), h264_decoder_mft_outputs, NULL)))
++        return hr;
+     if (FAILED(hr = DMORegister(L"Microsoft H264 Video Decoder DMO", &CLSID_MSH264DecoderMFT,
+             &DMOCATEGORY_VIDEO_DECODER, 0, ARRAY_SIZE(h264_decoder_dmo_inputs), h264_decoder_dmo_inputs,
+             ARRAY_SIZE(h264_decoder_dmo_outputs), h264_decoder_dmo_outputs)))
+@@ -119,6 +133,8 @@ HRESULT WINAPI DllUnregisterServer(void)
+         return hr;
+     if (FAILED(hr = MFTUnregister(CLSID_MSH264DecoderMFT)))
+         return hr;
++    if (FAILED(hr = MFTUnregister(CLSID_MSH265DecoderMFT)))
++        return hr;
+     if (FAILED(hr = DMOUnregister(&CLSID_MSH264DecoderMFT, &DMOCATEGORY_VIDEO_DECODER)))
+         return hr;
+     if (FAILED(hr = MFTUnregister(CLSID_MPEG4Part2DecoderMFT)))
+diff --git a/dlls/msmpeg2vdec/msmpeg2vdec.idl b/dlls/msmpeg2vdec/msmpeg2vdec.idl
+--- a/dlls/msmpeg2vdec/msmpeg2vdec.idl
++++ b/dlls/msmpeg2vdec/msmpeg2vdec.idl
+@@ -26,6 +26,12 @@ coclass CMSH264DecoderMFT {}
+ 
+ [
+     threading(both),
++    uuid(420a51a3-d605-430c-b4fc-45274fa6c562)
++]
++coclass CMSH265DecoderMFT {}
++
++[
++    threading(both),
+     uuid(2d709e52-123f-49b5-9cbc-9af5cde28fb9)
+ ]
+ coclass CMPEG4Part2DecoderMFT {}
+diff --git a/dlls/winedmo/mfplat.c b/dlls/winedmo/mfplat.c
+--- a/dlls/winedmo/mfplat.c
++++ b/dlls/winedmo/mfplat.c
+@@ -137,6 +137,7 @@ static const GUID CLSID_WineDMOByteStreamHandler = {0x317df618, 0x5e5a, 0x468a,
+ static const GUID CLSID_winedmo_video_processor = {0xd527607f,0x89cb,0x4e94,{0x95,0x71,0xbc,0xfe,0x62,0x17,0x56,0x13}};
+ static const GUID CLSID_winedmo_aac_decoder = {0xe7889a8a,0x2083,0x4844,{0x83,0x70,0x5e,0xe3,0x49,0xb1,0x45,0x03}};
+ static const GUID CLSID_winedmo_h264_decoder = {0x1f1e273d,0x12c0,0x4b3a,{0x8e,0x9b,0x19,0x33,0xc2,0x49,0x8a,0xea}};
++static const GUID CLSID_winedmo_h265_decoder = {0x57d81884,0x432c,0x449d,{0x9c,0x61,0xc8,0xab,0xb4,0xd5,0x95,0x65}};
+ static const GUID CLSID_winedmo_h264_encoder = {0x6c34de69,0x4670,0x46cd,{0x8c,0xb4,0x1f,0x2f,0xa1,0xdf,0xfb,0x65}};
+ 
+ static const GUID CLSID_WineDMOSchemePlugin = {0x587eeb6a,0x7336,0x4ebd,{0xa4,0xf2,0x91,0xc9,0x48,0xde,0x62,0x2c}};
+@@ -155,6 +156,7 @@ class_objects[] =
+     { &CLSID_WineDMOSchemePlugin, &winedmo_scheme_handler_create },
+     { &CLSID_winedmo_aac_decoder, &aac_decoder_create },
+     { &CLSID_winedmo_h264_decoder, &h264_decoder_create, &h264_decoder_create_aggregated },
++    { &CLSID_winedmo_h265_decoder, &h265_decoder_create, &h265_decoder_create_aggregated },
+     { &CLSID_winedmo_h264_encoder, &h264_encoder_create },
+ };
+ 
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2472,6 +2472,56 @@ HRESULT h264_decoder_create(REFIID riid, void **out)
+ {
+     return h264_decoder_create_aggregated(NULL, riid, out);
+ }
++
++static const GUID *const h265_decoder_input_types[] =
++{
++    &MFVideoFormat_HEVC,
++    &MFVideoFormat_HEVC_ES,
++    &MFVideoFormat_H265,
++};
++
++HRESULT h265_decoder_create_aggregated(IUnknown *outer, REFIID riid, void **out)
++{
++    struct video_decoder *decoder;
++    HRESULT hr;
++
++    TRACE("outer %p, riid %s, out %p.\n", outer, debugstr_guid(riid), out);
++
++    if (FAILED(hr = video_decoder_create_with_types(h265_decoder_input_types, ARRAY_SIZE(h265_decoder_input_types),
++            video_decoder_output_types, ARRAY_SIZE(video_decoder_output_types), outer, &decoder)))
++        return hr;
++
++    decoder->input_info.dwFlags = MFT_INPUT_STREAM_WHOLE_SAMPLES | MFT_INPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER
++            | MFT_INPUT_STREAM_FIXED_SAMPLE_SIZE;
++    decoder->input_info.cbSize = 0x1000;
++    decoder->output_info.dwFlags = MFT_OUTPUT_STREAM_WHOLE_SAMPLES | MFT_OUTPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER
++            | MFT_OUTPUT_STREAM_FIXED_SAMPLE_SIZE;
++    decoder->output_info.cbSize = 1920 * 1088 * 2;
++
++    TRACE("Created h265 transform %p.\n", &decoder->IMFTransform_iface);
++
++    if (outer)
++    {
++        if (!IsEqualGUID(riid, &IID_IUnknown))
++        {
++            IUnknown_Release(&decoder->IUnknown_inner);
++            *out = NULL;
++            return E_NOINTERFACE;
++        }
++
++        *out = &decoder->IUnknown_inner;
++        return S_OK;
++    }
++
++    hr = IMFTransform_QueryInterface(&decoder->IMFTransform_iface, riid, out);
++    IMFTransform_Release(&decoder->IMFTransform_iface);
++    return hr;
++}
++
++HRESULT h265_decoder_create(REFIID riid, void **out)
++{
++    return h265_decoder_create_aggregated(NULL, riid, out);
++}
+ 
+ extern GUID MFVideoFormat_IV50;
+ static const GUID *const iv50_decoder_input_types[] =
+diff --git a/dlls/winedmo/winedmo_classes.idl b/dlls/winedmo/winedmo_classes.idl
+--- a/dlls/winedmo/winedmo_classes.idl
++++ b/dlls/winedmo/winedmo_classes.idl
+@@ -125,6 +125,12 @@ coclass wg_wmv_decoder {}
+ ]
+ coclass wg_h264_decoder {}
+ 
++[
++    threading(both),
++    uuid(57d81884-432c-449d-9c61-c8abb4d59565)
++]
++coclass winedmo_h265_decoder {}
++
+ [
+     threading(both),
+     uuid(6c34de69-4670-46cd-8cb4-1f2fa1dffb65)
+diff --git a/dlls/winedmo/winedmo_private.h b/dlls/winedmo/winedmo_private.h
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -114,5 +114,7 @@ HRESULT aac_decoder_create(REFIID riid, void **ret);
+ HRESULT h264_decoder_create(REFIID riid, void **ret);
+ HRESULT h264_decoder_create_aggregated(IUnknown *outer, REFIID riid, void **ret);
++HRESULT h265_decoder_create(REFIID riid, void **ret);
++HRESULT h265_decoder_create_aggregated(IUnknown *outer, REFIID riid, void **ret);
+ HRESULT video_processor_create(REFIID riid, void **ret);
+ HRESULT winedmo_scheme_handler_create(REFIID riid, void **ret);
+ 
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -173,6 +173,7 @@ static enum AVCodecID codec_id_from_video_format( const MFVIDEOFORMAT *mfvf )
+         return AV_CODEC_ID_H264;
+     case MAKEFOURCC('H','E','V','C'): case MAKEFOURCC('h','e','v','c'):
+     case MAKEFOURCC('H','2','6','5'): case MAKEFOURCC('h','2','6','5'):
++    case MAKEFOURCC('H','E','V','S'): case MAKEFOURCC('h','e','v','s'):
+         return AV_CODEC_ID_HEVC;
+     case MAKEFOURCC('V','P','8','0'):  return AV_CODEC_ID_VP8;
+     case MAKEFOURCC('V','P','9','0'):  return AV_CODEC_ID_VP9;
+-- 
+2.50.1
