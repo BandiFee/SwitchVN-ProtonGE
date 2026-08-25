@@ -31,3 +31,6 @@ filename order.
 - `0031-quartz-reuse-vmr7-yuv-chroma-calculations.patch`:
   Reuse YUV 4:2:0 chroma contributions across each 2x2 pixel block and compute
   the shared luma term only once per output pixel.
+- `0032-quartz-add-sse2-ssse3-vmr7-yuv-conversion.patch`:
+  Convert VMR7 NV12 and YV12 frames eight pixels at a time with SSE2, using
+  SSSE3 shuffles for interleaved NV12 chroma and scalar code for edge fallback.

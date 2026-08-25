@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 26 Aug 2026 00:00:02 +0800
+Subject: [PATCH] quartz: add SSE2 and SSSE3 VMR7 YUV conversion
+
+Convert eight luma pixels at a time while reusing each group of four chroma
+samples for both rows of a YUV 4:2:0 block.  Use an SSSE3 shuffle path for
+interleaved NV12 chroma and an SSE2 path for NV12 and planar YV12.
+
+Select the SIMD implementation through Windows processor feature flags and
+retain the scalar converter for non-x86 targets, CPUs without SSE2, and image
+edges which are not a multiple of eight pixels.  The packed arithmetic keeps
+the scalar BT.601 coefficients, rounding, saturation, and RGB32 layout.
+---
+
+diff --git a/dlls/quartz/vmr7.c b/dlls/quartz/vmr7.c
+--- a/dlls/quartz/vmr7.c
++++ b/dlls/quartz/vmr7.c
+@@ -34,10 +34,15 @@
+ #include "dvdmedia.h"
+ #include "d3d9.h"
+ #include "videoacc.h"
+ #include "vmr9.h"
+ 
++#if defined(__i386__) || defined(__x86_64__)
++#include <emmintrin.h>
++#include <tmmintrin.h>
++#endif
++
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(quartz);
+ 
+ static const BITMAPINFOHEADER *get_bitmap_header(const AM_MEDIA_TYPE *mt)
+@@ -259,25 +264,259 @@ static void convert_yuv420_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+                     -100 * d - 208 * e + 128, 516 * d + 128);
+         }
+     }
+ }
+ 
++#if defined(__i386__) || defined(__x86_64__)
++
++#define SSE2_TARGET __attribute__((target("sse2")))
++#define SSSE3_TARGET __attribute__((target("ssse3")))
++
++struct yuv_chroma_sse2
++{
++    __m128i r_lo, r_hi;
++    __m128i g_lo, g_hi;
++    __m128i b_lo, b_hi;
++};
++
++static inline SSE2_TARGET struct yuv_chroma_sse2 get_yuv_chroma_sse2(__m128i d, __m128i e)
++{
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i round = _mm_set1_epi32(128);
++    const __m128i r_coeff = _mm_set1_epi32(409);
++    const __m128i g_coeff = _mm_set_epi16(-208, -100, -208, -100, -208, -100, -208, -100);
++    const __m128i b_coeff = _mm_set1_epi32(516);
++    struct yuv_chroma_sse2 chroma;
++    __m128i de_lo, de_hi;
++
++    chroma.r_lo = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(e, zero), r_coeff), round);
++    chroma.r_hi = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(e, zero), r_coeff), round);
++
++    de_lo = _mm_unpacklo_epi16(d, e);
++    de_hi = _mm_unpackhi_epi16(d, e);
++    chroma.g_lo = _mm_add_epi32(_mm_madd_epi16(de_lo, g_coeff), round);
++    chroma.g_hi = _mm_add_epi32(_mm_madd_epi16(de_hi, g_coeff), round);
++
++    chroma.b_lo = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(d, zero), b_coeff), round);
++    chroma.b_hi = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(d, zero), b_coeff), round);
++
++    return chroma;
++}
++
++static inline SSE2_TARGET __m128i pack_yuv_component_sse2(__m128i luma_lo, __m128i luma_hi,
++        __m128i chroma_lo, __m128i chroma_hi)
++{
++    const __m128i zero = _mm_setzero_si128();
++    __m128i value;
++
++    value = _mm_packs_epi32(_mm_srai_epi32(_mm_add_epi32(luma_lo, chroma_lo), 8),
++            _mm_srai_epi32(_mm_add_epi32(luma_hi, chroma_hi), 8));
++    return _mm_packus_epi16(value, zero);
++}
++
++static inline SSE2_TARGET void convert_yuv8_to_rgb32_sse2(DWORD *dst, const BYTE *y,
++        const struct yuv_chroma_sse2 *chroma)
++{
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i y_offset = _mm_set1_epi16(16);
++    const __m128i y_coeff = _mm_set1_epi32(298);
++    __m128i y_value, luma_lo, luma_hi, r, g, b, bg, rz;
++
++    y_value = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)y), zero);
++    y_value = _mm_subs_epu16(y_value, y_offset);
++    luma_lo = _mm_madd_epi16(_mm_unpacklo_epi16(y_value, zero), y_coeff);
++    luma_hi = _mm_madd_epi16(_mm_unpackhi_epi16(y_value, zero), y_coeff);
++
++    r = pack_yuv_component_sse2(luma_lo, luma_hi, chroma->r_lo, chroma->r_hi);
++    g = pack_yuv_component_sse2(luma_lo, luma_hi, chroma->g_lo, chroma->g_hi);
++    b = pack_yuv_component_sse2(luma_lo, luma_hi, chroma->b_lo, chroma->b_hi);
++
++    bg = _mm_unpacklo_epi8(b, g);
++    rz = _mm_unpacklo_epi8(r, zero);
++    _mm_storeu_si128((__m128i *)dst, _mm_unpacklo_epi16(bg, rz));
++    _mm_storeu_si128((__m128i *)(dst + 4), _mm_unpackhi_epi16(bg, rz));
++}
++
++static SSE2_TARGET void convert_nv12_blocks_sse2(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *y_plane, unsigned int y_pitch, const BYTE *uv_plane,
++        unsigned int uv_pitch, unsigned int width, unsigned int height)
++{
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i chroma_offset = _mm_set1_epi16(128);
++    unsigned int x, y;
++
++    for (y = 0; y < height; y += 2)
++    {
++        DWORD *dst_row0 = (DWORD *)(dst + dst_pitch * y);
++        DWORD *dst_row1 = (DWORD *)(dst + dst_pitch * (y + 1));
++        const BYTE *y_row0 = y_plane + y_pitch * y;
++        const BYTE *y_row1 = y_plane + y_pitch * (y + 1);
++        const BYTE *uv_row = uv_plane + uv_pitch * (y / 2);
++
++        for (x = 0; x < width; x += 8)
++        {
++            struct yuv_chroma_sse2 chroma;
++            __m128i uv, d, e;
++
++            uv = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(uv_row + x)), zero);
++            d = _mm_shufflelo_epi16(uv, _MM_SHUFFLE(2, 2, 0, 0));
++            d = _mm_shufflehi_epi16(d, _MM_SHUFFLE(2, 2, 0, 0));
++            e = _mm_shufflelo_epi16(uv, _MM_SHUFFLE(3, 3, 1, 1));
++            e = _mm_shufflehi_epi16(e, _MM_SHUFFLE(3, 3, 1, 1));
++            chroma = get_yuv_chroma_sse2(_mm_sub_epi16(d, chroma_offset),
++                    _mm_sub_epi16(e, chroma_offset));
++
++            convert_yuv8_to_rgb32_sse2(dst_row0 + x, y_row0 + x, &chroma);
++            convert_yuv8_to_rgb32_sse2(dst_row1 + x, y_row1 + x, &chroma);
++        }
++    }
++}
++
++static SSSE3_TARGET void convert_nv12_blocks_ssse3(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *y_plane, unsigned int y_pitch, const BYTE *uv_plane,
++        unsigned int uv_pitch, unsigned int width, unsigned int height)
++{
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i chroma_offset = _mm_set1_epi16(128);
++    const __m128i u_shuffle = _mm_setr_epi8(0, 0, 2, 2, 4, 4, 6, 6,
++            -1, -1, -1, -1, -1, -1, -1, -1);
++    const __m128i v_shuffle = _mm_setr_epi8(1, 1, 3, 3, 5, 5, 7, 7,
++            -1, -1, -1, -1, -1, -1, -1, -1);
++    unsigned int x, y;
++
++    for (y = 0; y < height; y += 2)
++    {
++        DWORD *dst_row0 = (DWORD *)(dst + dst_pitch * y);
++        DWORD *dst_row1 = (DWORD *)(dst + dst_pitch * (y + 1));
++        const BYTE *y_row0 = y_plane + y_pitch * y;
++        const BYTE *y_row1 = y_plane + y_pitch * (y + 1);
++        const BYTE *uv_row = uv_plane + uv_pitch * (y / 2);
++
++        for (x = 0; x < width; x += 8)
++        {
++            struct yuv_chroma_sse2 chroma;
++            __m128i uv, d, e;
++
++            uv = _mm_loadl_epi64((const __m128i *)(uv_row + x));
++            d = _mm_unpacklo_epi8(_mm_shuffle_epi8(uv, u_shuffle), zero);
++            e = _mm_unpacklo_epi8(_mm_shuffle_epi8(uv, v_shuffle), zero);
++            chroma = get_yuv_chroma_sse2(_mm_sub_epi16(d, chroma_offset),
++                    _mm_sub_epi16(e, chroma_offset));
++
++            convert_yuv8_to_rgb32_sse2(dst_row0 + x, y_row0 + x, &chroma);
++            convert_yuv8_to_rgb32_sse2(dst_row1 + x, y_row1 + x, &chroma);
++        }
++    }
++}
++
++static SSE2_TARGET void convert_yv12_blocks_sse2(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *y_plane, unsigned int y_pitch, const BYTE *u_plane,
++        const BYTE *v_plane, unsigned int chroma_pitch, unsigned int width,
++        unsigned int height)
++{
++    const __m128i zero = _mm_setzero_si128();
++    const __m128i chroma_offset = _mm_set1_epi16(128);
++    unsigned int x, y;
++
++    for (y = 0; y < height; y += 2)
++    {
++        DWORD *dst_row0 = (DWORD *)(dst + dst_pitch * y);
++        DWORD *dst_row1 = (DWORD *)(dst + dst_pitch * (y + 1));
++        const BYTE *y_row0 = y_plane + y_pitch * y;
++        const BYTE *y_row1 = y_plane + y_pitch * (y + 1);
++        const BYTE *u_row = u_plane + chroma_pitch * (y / 2);
++        const BYTE *v_row = v_plane + chroma_pitch * (y / 2);
++
++        for (x = 0; x < width; x += 8)
++        {
++            struct yuv_chroma_sse2 chroma;
++            DWORD u_value, v_value;
++            __m128i d, e;
++
++            memcpy(&u_value, u_row + x / 2, sizeof(u_value));
++            memcpy(&v_value, v_row + x / 2, sizeof(v_value));
++            d = _mm_unpacklo_epi8(_mm_cvtsi32_si128(u_value), zero);
++            e = _mm_unpacklo_epi8(_mm_cvtsi32_si128(v_value), zero);
++            d = _mm_sub_epi16(_mm_unpacklo_epi16(d, d), chroma_offset);
++            e = _mm_sub_epi16(_mm_unpacklo_epi16(e, e), chroma_offset);
++            chroma = get_yuv_chroma_sse2(d, e);
++
++            convert_yuv8_to_rgb32_sse2(dst_row0 + x, y_row0 + x, &chroma);
++            convert_yuv8_to_rgb32_sse2(dst_row1 + x, y_row1 + x, &chroma);
++        }
++    }
++}
++
++#endif
++
+ static void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+         const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
+ {
+     const BYTE *uv_plane = src + src_pitch * height;
+ 
++#if defined(__i386__) || defined(__x86_64__)
++    if (width >= 8 && height >= 2 && IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE))
++    {
++        unsigned int simd_width = width & ~7u;
++        unsigned int simd_height = height & ~1u;
++
++        if (IsProcessorFeaturePresent(PF_SSSE3_INSTRUCTIONS_AVAILABLE))
++            convert_nv12_blocks_ssse3(dst, dst_pitch, src, src_pitch, uv_plane,
++                    src_pitch, simd_width, simd_height);
++        else
++            convert_nv12_blocks_sse2(dst, dst_pitch, src, src_pitch, uv_plane,
++                    src_pitch, simd_width, simd_height);
++
++        if (simd_width < width)
++            convert_yuv420_to_rgb32(dst + simd_width * sizeof(DWORD), dst_pitch,
++                    src + simd_width, src_pitch, uv_plane + simd_width, uv_plane + simd_width + 1,
++                    src_pitch, 2, width - simd_width, simd_height);
++        if (simd_height < height)
++            convert_yuv420_to_rgb32(dst + simd_height * dst_pitch, dst_pitch,
++                    src + simd_height * src_pitch, src_pitch,
++                    uv_plane + (simd_height / 2) * src_pitch,
++                    uv_plane + (simd_height / 2) * src_pitch + 1,
++                    src_pitch, 2, width, height - simd_height);
++        return;
++    }
++#endif
++
+     convert_yuv420_to_rgb32(dst, dst_pitch, src, src_pitch, uv_plane, uv_plane + 1,
+             src_pitch, 2, width, height);
+ }
+ 
+ static void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+         const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
+ {
+     const BYTE *v_plane = src + src_pitch * height;
+     const BYTE *u_plane = v_plane + (src_pitch / 2) * (height / 2);
+ 
++#if defined(__i386__) || defined(__x86_64__)
++    if (width >= 8 && height >= 2 && IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE))
++    {
++        unsigned int chroma_pitch = src_pitch / 2;
++        unsigned int simd_width = width & ~7u;
++        unsigned int simd_height = height & ~1u;
++
++        convert_yv12_blocks_sse2(dst, dst_pitch, src, src_pitch, u_plane, v_plane,
++                chroma_pitch, simd_width, simd_height);
++
++        if (simd_width < width)
++            convert_yuv420_to_rgb32(dst + simd_width * sizeof(DWORD), dst_pitch,
++                    src + simd_width, src_pitch, u_plane + simd_width / 2,
++                    v_plane + simd_width / 2, chroma_pitch, 1,
++                    width - simd_width, simd_height);
++        if (simd_height < height)
++            convert_yuv420_to_rgb32(dst + simd_height * dst_pitch, dst_pitch,
++                    src + simd_height * src_pitch, src_pitch,
++                    u_plane + (simd_height / 2) * chroma_pitch,
++                    v_plane + (simd_height / 2) * chroma_pitch,
++                    chroma_pitch, 1, width, height - simd_height);
++        return;
++    }
++#endif
++
+     convert_yuv420_to_rgb32(dst, dst_pitch, src, src_pitch, u_plane, v_plane,
+             src_pitch / 2, 1, width, height);
+ }
+ 
+ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+
+-- 
+2.51.0
+
