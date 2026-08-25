@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Tue, 25 Aug 2026 00:00:00 +0800
+Subject: [PATCH] wmp: use logarithmic volume scaling
+
+IWMPSettings exposes a linear 0--100 volume level, while IBasicAudio expects
+hundredths of a decibel on a logarithmic -10000--0 scale.  Mapping the two
+ranges linearly turns an ordinary WMP volume such as 37 into -6300 (-63 dB),
+making decoded video audio practically inaudible.
+
+Convert the WMP level to an amplitude ratio before passing it to
+IBasicAudio.  This matches the conversion already used by mciqtz and maps 37
+to about -864 (-8.64 dB), while preserving silence at zero and full volume at
+100.
+---
+
+diff --git a/dlls/wmp/player.c b/dlls/wmp/player.c
+index 708fd9c7acb..9fe3a97d0c7 100644
+--- a/dlls/wmp/player.c
++++ b/dlls/wmp/player.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "wmp_private.h"
++#include <math.h>
+ 
+ #include "wine/debug.h"
+ #include <nserror.h>
+@@ -988,8 +989,10 @@ static HRESULT WINAPI WMPSettings_put_volume(IWMPSettings *iface, LONG v)
+     if (!This->filter_graph)
+         return S_OK;
+ 
+-    /* IBasicAudio -   [-10000, 0], wmp - [0, 100] */
+-    v = 10000 * v / 100 - 10000;
++    /* IWMPSettings uses a linear amplitude level, while IBasicAudio uses
++     * hundredths of a decibel. */
++    v = v ? 2000.0 * (log10(v) - 2.0) : -10000;
++
+     if (!This->basic_audio)
+         return S_FALSE;
+ 
+-- 
+2.51.0
+

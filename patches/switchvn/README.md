@@ -22,3 +22,6 @@ filename order.
   Complete `IWMPPlayer2` compatibility for AxInterop.WMPLib, including the
   extended vtable, persisted presentation properties, open/play state, and
   close behavior used during AxHost initialization.
+- `0029-wmp-use-logarithmic-volume-scaling.patch`:
+  Convert WMP's 0--100 volume level to DirectShow's logarithmic decibel scale
+  so normal application volume levels remain audible.
