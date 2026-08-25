@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 26 Aug 2026 00:00:01 +0800
+Subject: [PATCH] quartz: reuse chroma calculations in VMR7 YUV conversion
+
+YUV 4:2:0 stores one chroma sample for each 2x2 block.  The scalar VMR7
+conversion recalculates the same U/V terms and the luma multiplier for every
+RGB component of every pixel.
+
+Calculate the chroma contributions once per 2x2 block and the luma term once
+per pixel.  Share the optimized converter between NV12 and YV12 while
+preserving the existing BT.601 coefficients, rounding, clamping,
+odd-dimension handling, and RGB32 byte layout.
+---
+
+diff --git a/dlls/quartz/vmr7.c b/dlls/quartz/vmr7.c
+--- a/dlls/quartz/vmr7.c
++++ b/dlls/quartz/vmr7.c
+@@ -168,74 +168,118 @@ static BYTE clamp_rgb_value(int value)
+     if (value > 255)
+         return 255;
+     return value;
+ }
+ 
+-static void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+-        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++static inline DWORD yuv_to_rgb32(BYTE y, int r_chroma, int g_chroma, int b_chroma)
++{
++    int c = y - 16;
++    int luma;
++
++    if (c < 0)
++        c = 0;
++    luma = 298 * c;
++
++    return (clamp_rgb_value((luma + r_chroma) >> 8) << 16)
++            | (clamp_rgb_value((luma + g_chroma) >> 8) << 8)
++            | clamp_rgb_value((luma + b_chroma) >> 8);
++}
++
++static inline void yuv_pair_to_rgb32(DWORD *dst, const BYTE *y,
++        int r_chroma, int g_chroma, int b_chroma)
++{
++    dst[0] = yuv_to_rgb32(y[0], r_chroma, g_chroma, b_chroma);
++    dst[1] = yuv_to_rgb32(y[1], r_chroma, g_chroma, b_chroma);
++}
++
++static void convert_yuv420_to_rgb32(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *y_plane, unsigned int y_pitch, const BYTE *u_plane,
++        const BYTE *v_plane, unsigned int chroma_pitch, unsigned int chroma_step,
++        unsigned int width, unsigned int height)
+ {
+-    const BYTE *y_plane = src;
+-    const BYTE *uv_plane = src + src_pitch * height;
+     unsigned int x, y;
+ 
+-    for (y = 0; y < height; ++y)
++    for (y = 0; y + 1 < height; y += 2)
++    {
++        DWORD *dst_row0 = (DWORD *)(dst + dst_pitch * y);
++        DWORD *dst_row1 = (DWORD *)(dst + dst_pitch * (y + 1));
++        const BYTE *y_row0 = y_plane + y_pitch * y;
++        const BYTE *y_row1 = y_plane + y_pitch * (y + 1);
++        const BYTE *u_row = u_plane + chroma_pitch * (y / 2);
++        const BYTE *v_row = v_plane + chroma_pitch * (y / 2);
++
++        for (x = 0; x + 1 < width; x += 2, u_row += chroma_step, v_row += chroma_step)
++        {
++            int d = *u_row - 128;
++            int e = *v_row - 128;
++            int r_chroma = 409 * e + 128;
++            int g_chroma = -100 * d - 208 * e + 128;
++            int b_chroma = 516 * d + 128;
++
++            yuv_pair_to_rgb32(dst_row0 + x, y_row0 + x, r_chroma, g_chroma, b_chroma);
++            yuv_pair_to_rgb32(dst_row1 + x, y_row1 + x, r_chroma, g_chroma, b_chroma);
++        }
++
++        if (x < width)
++        {
++            int d = *u_row - 128;
++            int e = *v_row - 128;
++            int r_chroma = 409 * e + 128;
++            int g_chroma = -100 * d - 208 * e + 128;
++            int b_chroma = 516 * d + 128;
++
++            dst_row0[x] = yuv_to_rgb32(y_row0[x], r_chroma, g_chroma, b_chroma);
++            dst_row1[x] = yuv_to_rgb32(y_row1[x], r_chroma, g_chroma, b_chroma);
++        }
++    }
++
++    if (y < height)
+     {
+         DWORD *dst_row = (DWORD *)(dst + dst_pitch * y);
+-        const BYTE *y_row = y_plane + src_pitch * y;
+-        const BYTE *uv_row = uv_plane + src_pitch * (y / 2);
++        const BYTE *y_row = y_plane + y_pitch * y;
++        const BYTE *u_row = u_plane + chroma_pitch * (y / 2);
++        const BYTE *v_row = v_plane + chroma_pitch * (y / 2);
+ 
+-        for (x = 0; x < width; ++x)
++        for (x = 0; x + 1 < width; x += 2, u_row += chroma_step, v_row += chroma_step)
+         {
+-            int c = y_row[x] - 16;
+-            int d = uv_row[(x & ~1) + 0] - 128;
+-            int e = uv_row[(x & ~1) + 1] - 128;
+-            BYTE r, g, b;
++            int d = *u_row - 128;
++            int e = *v_row - 128;
++            int r_chroma = 409 * e + 128;
++            int g_chroma = -100 * d - 208 * e + 128;
++            int b_chroma = 516 * d + 128;
+ 
+-            if (c < 0)
+-                c = 0;
++            yuv_pair_to_rgb32(dst_row + x, y_row + x, r_chroma, g_chroma, b_chroma);
++        }
+ 
+-            r = clamp_rgb_value((298 * c + 409 * e + 128) >> 8);
+-            g = clamp_rgb_value((298 * c - 100 * d - 208 * e + 128) >> 8);
+-            b = clamp_rgb_value((298 * c + 516 * d + 128) >> 8);
++        if (x < width)
++        {
++            int d = *u_row - 128;
++            int e = *v_row - 128;
+ 
+-            dst_row[x] = (r << 16) | (g << 8) | b;
++            dst_row[x] = yuv_to_rgb32(y_row[x], 409 * e + 128,
++                    -100 * d - 208 * e + 128, 516 * d + 128);
+         }
+     }
+ }
+ 
++static void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++{
++    const BYTE *uv_plane = src + src_pitch * height;
++
++    convert_yuv420_to_rgb32(dst, dst_pitch, src, src_pitch, uv_plane, uv_plane + 1,
++            src_pitch, 2, width, height);
++}
++
+ static void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+         const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
+ {
+-    const BYTE *y_plane = src;
+     const BYTE *v_plane = src + src_pitch * height;
+     const BYTE *u_plane = v_plane + (src_pitch / 2) * (height / 2);
+-    unsigned int x, y;
+-
+-    for (y = 0; y < height; ++y)
+-    {
+-        DWORD *dst_row = (DWORD *)(dst + dst_pitch * y);
+-        const BYTE *y_row = y_plane + src_pitch * y;
+-        const BYTE *u_row = u_plane + (src_pitch / 2) * (y / 2);
+-        const BYTE *v_row = v_plane + (src_pitch / 2) * (y / 2);
+-
+-        for (x = 0; x < width; ++x)
+-        {
+-            int c = y_row[x] - 16;
+-            int d = u_row[x / 2] - 128;
+-            int e = v_row[x / 2] - 128;
+-            BYTE r, g, b;
+ 
+-            if (c < 0)
+-                c = 0;
+-
+-            r = clamp_rgb_value((298 * c + 409 * e + 128) >> 8);
+-            g = clamp_rgb_value((298 * c - 100 * d - 208 * e + 128) >> 8);
+-            b = clamp_rgb_value((298 * c + 516 * d + 128) >> 8);
+-
+-            dst_row[x] = (r << 16) | (g << 8) | b;
+-        }
+-    }
++    convert_yuv420_to_rgb32(dst, dst_pitch, src, src_pitch, u_plane, v_plane,
++            src_pitch / 2, 1, width, height);
+ }
+ 
+ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+ {
+     struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
+-- 
+2.51.0
+

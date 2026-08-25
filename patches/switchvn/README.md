@@ -28,3 +28,6 @@ filename order.
 - `0030-quartz-prefer-directdraw-blit-for-vmr7-yuv.patch`:
   Present VMR7's already converted RGB32 video surface through DirectDraw and
   retain `StretchDIBits` only as a compatibility fallback.
+- `0031-quartz-reuse-vmr7-yuv-chroma-calculations.patch`:
+  Reuse YUV 4:2:0 chroma contributions across each 2x2 pixel block and compute
+  the shared luma term only once per output pixel.
