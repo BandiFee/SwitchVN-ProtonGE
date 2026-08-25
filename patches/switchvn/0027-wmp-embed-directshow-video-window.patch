@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Tue, 25 Aug 2026 00:00:00 +0800
+Subject: [PATCH] wmp: embed DirectShow video in the ActiveX control
+
+Keep the windowless in-place site reference alive for the complete activation
+sequence.  The previous early release could invalidate an AxHost container
+before the WMP child window was created.
+
+Retain the DirectShow IVideoWindow exposed by the filter graph and embed it in
+the WMP ActiveX child window.  Keep its owner, message drain and dimensions in
+sync with the control, and detach it before the control or graph is destroyed.
+
+Add a regression check for balanced in-place site references.
+---
+
+diff --git a/dlls/wmp/oleobj.c b/dlls/wmp/oleobj.c
+index 628130783b8..b81cb94a9a7 100644
+--- a/dlls/wmp/oleobj.c
++++ b/dlls/wmp/oleobj.c
+@@ -144,7 +144,6 @@ static HRESULT activate_inplace(WindowsMediaPlayer *This)
+     hres = IOleClientSite_QueryInterface(This->client_site, &IID_IOleInPlaceSiteWindowless, (void**)&ipsite_windowless);
+     if(SUCCEEDED(hres)) {
+         hres = IOleInPlaceSiteWindowless_CanWindowlessActivate(ipsite_windowless);
+-        IOleInPlaceSiteWindowless_Release(ipsite_windowless);
+         if(hres == S_OK)
+             FIXME("Windowless activation not supported\n");
+         ipsiteex = (IOleInPlaceSiteEx*)ipsite_windowless;
+@@ -177,6 +176,7 @@ static HRESULT activate_inplace(WindowsMediaPlayer *This)
+     if(!This->hwnd)
+         return E_FAIL;
+ 
++    wmp_attach_video_window(This);
+     IOleClientSite_ShowObject(This->client_site);
+     return S_OK;
+ }
+@@ -192,6 +192,7 @@ static void deactivate_window(WindowsMediaPlayer *This)
+         IOleInPlaceSite_Release(ip_site);
+     }
+ 
++    wmp_detach_video_window(This);
+     DestroyWindow(This->hwnd);
+     This->hwnd = NULL;
+ }
+@@ -639,6 +640,7 @@ static HRESULT WINAPI OleInPlaceObjectWindowless_SetObjectRects(IOleInPlaceObjec
+        SetWindowPos(This->hwnd, NULL, lprcPosRect->left, lprcPosRect->top,
+                lprcPosRect->right-lprcPosRect->left, lprcPosRect->bottom-lprcPosRect->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
++       wmp_resize_video_window(This);
+     }
+ 
+     return S_OK;
+diff --git a/dlls/wmp/player.c b/dlls/wmp/player.c
+index 583f5847907..97d0aa39a62 100644
+--- a/dlls/wmp/player.c
++++ b/dlls/wmp/player.c
+@@ -29,6 +29,53 @@ static ATOM player_msg_class;
+ static INIT_ONCE class_init_once;
+ static UINT WM_WMPEVENT;
+ 
++void wmp_resize_video_window(WindowsMediaPlayer *wmp)
++{
++    RECT rect;
++
++    if (!wmp->video_window || !wmp->hwnd || !GetClientRect(wmp->hwnd, &rect))
++        return;
++
++    IVideoWindow_SetWindowPosition(wmp->video_window, 0, 0,
++            rect.right - rect.left, rect.bottom - rect.top);
++}
++
++void wmp_attach_video_window(WindowsMediaPlayer *wmp)
++{
++    HRESULT hr;
++
++    if (!wmp->video_window || !wmp->hwnd)
++        return;
++
++    IVideoWindow_put_AutoShow(wmp->video_window, OAFALSE);
++    IVideoWindow_put_MessageDrain(wmp->video_window, (OAHWND)wmp->hwnd);
++
++    hr = IVideoWindow_put_Owner(wmp->video_window, (OAHWND)wmp->hwnd);
++    if (FAILED(hr))
++    {
++        WARN("Failed to set video window owner, hr %#lx.\n", hr);
++        return;
++    }
++
++    hr = IVideoWindow_put_WindowStyle(wmp->video_window,
++            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
++    if (FAILED(hr))
++        WARN("Failed to set video window style, hr %#lx.\n", hr);
++
++    wmp_resize_video_window(wmp);
++    IVideoWindow_put_Visible(wmp->video_window, OATRUE);
++}
++
++void wmp_detach_video_window(WindowsMediaPlayer *wmp)
++{
++    if (!wmp->video_window)
++        return;
++
++    IVideoWindow_put_Visible(wmp->video_window, OAFALSE);
++    IVideoWindow_put_MessageDrain(wmp->video_window, 0);
++    IVideoWindow_put_Owner(wmp->video_window, 0);
++}
++
+ static void update_state(WindowsMediaPlayer *wmp, LONG type, LONG state)
+ {
+     DISPPARAMS dispparams;
+@@ -1481,6 +1528,16 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
+ 
+         if (SUCCEEDED(hres))
+             hres = IGraphBuilder_RenderFile(This->filter_graph, This->media->url, NULL);
++        if (SUCCEEDED(hres))
++        {
++            HRESULT video_hr = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IVideoWindow,
++                    (void **)&This->video_window);
++
++            if (SUCCEEDED(video_hr))
++                wmp_attach_video_window(This);
++            else if (video_hr != E_NOINTERFACE)
++                WARN("Failed to get video window, hr %#lx.\n", video_hr);
++        }
+         if (SUCCEEDED(hres))
+             update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
+         if (SUCCEEDED(hres))
+@@ -1512,6 +1569,12 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
+ 
+         if (FAILED(hres))
+         {
++            if (This->video_window)
++            {
++                wmp_detach_video_window(This);
++                IVideoWindow_Release(This->video_window);
++                This->video_window = NULL;
++            }
+             if (This->filter_graph)
+             {
+                 IGraphBuilder_Release(This->filter_graph);
+@@ -1582,12 +1645,17 @@ static HRESULT WINAPI WMPControls_stop(IWMPControls *iface)
+     if (This->basic_audio) {
+         IBasicAudio_Release(This->basic_audio);
+     }
++    if (This->video_window) {
++        wmp_detach_video_window(This);
++        IVideoWindow_Release(This->video_window);
++    }
+     IGraphBuilder_Release(This->filter_graph);
+     This->filter_graph = NULL;
+     This->media_control = NULL;
+     This->media_event = NULL;
+     This->media_seeking = NULL;
+     This->basic_audio = NULL;
++    This->video_window = NULL;
+ 
+     update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposPlaylistOpenNoMedia);
+     update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsStopped);
+diff --git a/dlls/wmp/tests/oleobj.c b/dlls/wmp/tests/oleobj.c
+index 614434e7c1b..388c056f09b 100644
+--- a/dlls/wmp/tests/oleobj.c
++++ b/dlls/wmp/tests/oleobj.c
+@@ -572,14 +572,19 @@ static HRESULT WINAPI InPlaceSiteWindowless_QueryInterface(IOleInPlaceSiteWindow
+     return cs_qi(riid, ppv);
+ }
+ 
++static LONG inplace_site_ref = 1;
++
+ static ULONG WINAPI InPlaceSiteWindowless_AddRef(IOleInPlaceSiteWindowless *iface)
+ {
+-    return 2;
++    return InterlockedIncrement(&inplace_site_ref);
+ }
+ 
+ static ULONG WINAPI InPlaceSiteWindowless_Release(IOleInPlaceSiteWindowless *iface)
+ {
+-    return 1;
++    LONG ref = InterlockedDecrement(&inplace_site_ref);
++
++    ok(ref >= 1, "Unexpected in-place site refcount %ld.\n", ref);
++    return ref;
+ }
+ 
+ static HRESULT WINAPI InPlaceSiteWindowless_GetWindow(IOleInPlaceSiteWindowless *iface, HWND *phwnd)
+@@ -843,14 +848,12 @@ static HRESULT cs_qi(REFIID riid, void **ppv)
+         *ppv = &OleControlSite;
+     }else if(IsEqualGUID(riid, &IID_IDispatch)) {
+         *ppv = &Dispatch;
+-    }else if(IsEqualGUID(&IID_IOleWindow, riid)) {
+-        *ppv = &InPlaceSiteWindowless;
+-    }else if(IsEqualGUID(&IID_IOleInPlaceSite, riid)) {
+-        *ppv = &InPlaceSiteWindowless;
+-    }else if(IsEqualGUID(&IID_IOleInPlaceSiteEx, riid)) {
+-        *ppv = &InPlaceSiteWindowless;
+-    }else if(IsEqualGUID(&IID_IOleInPlaceSiteWindowless, riid)) {
++    }else if(IsEqualGUID(&IID_IOleWindow, riid)
++            || IsEqualGUID(&IID_IOleInPlaceSite, riid)
++            || IsEqualGUID(&IID_IOleInPlaceSiteEx, riid)
++            || IsEqualGUID(&IID_IOleInPlaceSiteWindowless, riid)) {
+         *ppv = &InPlaceSiteWindowless;
++        IOleInPlaceSiteWindowless_AddRef(&InPlaceSiteWindowless);
+     }else {
+         trace("QI(%s)\n", wine_dbgstr_guid(riid));
+         *ppv = NULL;
+@@ -1370,6 +1373,7 @@ static void test_wmp(void)
+ 
+     ref = IOleObject_Release(oleobj);
+     ok(!ref, "ref = %ld\n", ref);
++    ok(inplace_site_ref == 1, "Unexpected in-place site refcount %ld.\n", inplace_site_ref);
+ }
+ 
+ static LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+diff --git a/dlls/wmp/wmp_private.h b/dlls/wmp/wmp_private.h
+index b5e580d91ca..7a80746ed4a 100644
+--- a/dlls/wmp/wmp_private.h
++++ b/dlls/wmp/wmp_private.h
+@@ -106,6 +106,7 @@ struct WindowsMediaPlayer {
+     IMediaEvent* media_event;
+     IMediaSeeking* media_seeking;
+     IBasicAudio* basic_audio;
++    IVideoWindow* video_window;
+ 
+     /* Async event notification */
+     HWND msg_window;
+@@ -113,6 +114,9 @@ struct WindowsMediaPlayer {
+ 
+ BOOL init_player(WindowsMediaPlayer*);
+ void destroy_player(WindowsMediaPlayer*);
++void wmp_attach_video_window(WindowsMediaPlayer *wmp);
++void wmp_detach_video_window(WindowsMediaPlayer *wmp);
++void wmp_resize_video_window(WindowsMediaPlayer *wmp);
+ WMPMedia *unsafe_impl_from_IWMPMedia(IWMPMedia *iface);
+ WMPPlaylist *unsafe_impl_from_IWMPPlaylist(IWMPPlaylist *iface);
+ HRESULT create_media_from_url(BSTR url, double duration, IWMPMedia **ppMedia);
+-- 
+2.51.0
+

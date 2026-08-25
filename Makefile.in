@@ -347,7 +347,7 @@ $(OBJ)/.pipewire-alsa-aarch64-build:
 FFMPEG_DEPENDS = bzip2 dav1d xz
 
 FFMPEG_CONFIGURE_ARGS := \
-	--extra-version=SwitchVN-1 \
+	--extra-version=SwitchVN-2 \
 	--enable-shared \
 	--disable-static \
 	--disable-everything \

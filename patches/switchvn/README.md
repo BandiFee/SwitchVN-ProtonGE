@@ -15,3 +15,6 @@ filename order.
 - `0026-winedmo-hevc-media-foundation-decoder.patch`:
   Media Foundation H.265/HEVC decoder registration backed by winedmo and
   envideo.
+- `0027-wmp-embed-directshow-video-window.patch`:
+  Balanced WMP ActiveX in-place activation lifetime and embedded DirectShow
+  video-window ownership, sizing, visibility, and cleanup.
