@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 26 Aug 2026 00:00:00 +0800
+Subject: [PATCH] quartz: prefer DirectDraw blits for converted VMR7 YUV frames
+
+The VMR7 allocator exposes an RGB32 surface for NV12 and YV12 input, and the
+renderer has already converted the decoded frame into that surface before it
+is presented.  Locking the surface again and copying it through StretchDIBits
+adds a second synchronous CPU presentation path to every frame.
+
+Try the normal DirectDraw primary-surface blit first.  Keep StretchDIBits as a
+fallback for drivers which cannot blit the converted surface so this remains
+compatible with the existing legacy path.
+---
+
+diff --git a/dlls/quartz/vmr7_presenter.c b/dlls/quartz/vmr7_presenter.c
+index a69b07a3d63..362001b5f25 100644
+--- a/dlls/quartz/vmr7_presenter.c
++++ b/dlls/quartz/vmr7_presenter.c
+@@ -128,12 +128,22 @@ static HRESULT WINAPI image_presenter_PresentImage(IVMRImagePresenter *iface,
+     if (info->dwFlags & VMRSample_SrcDstRectsValid)
+         FIXME("Ignoring src/dst rects.\n");
+ 
++    GetClientRect(presenter->window, &rect);
++    point.x = point.y = 0;
++    ClientToScreen(presenter->window, &point);
++    OffsetRect(&rect, point.x, point.y);
++    if (SUCCEEDED(hr = IDirectDrawSurface7_Blt(presenter->primary, &rect,
++            info->lpSurf, NULL, DDBLT_WAIT, NULL)))
++        return S_OK;
++
+     if (presenter->yuv_to_rgb)
+     {
+         DDSURFACEDESC2 surface_desc = {.dwSize = sizeof(surface_desc)};
+         BITMAPINFO bitmap_info = {0};
+         HDC dc;
+ 
++        TRACE("DirectDraw blit failed, hr %#lx; falling back to StretchDIBits.\n", hr);
++
+         if (SUCCEEDED(IDirectDrawSurface7_Lock(info->lpSurf, NULL, &surface_desc, DDLOCK_WAIT | DDLOCK_READONLY, NULL)))
+         {
+             GetClientRect(presenter->window, &rect);
+@@ -155,12 +165,7 @@ static HRESULT WINAPI image_presenter_PresentImage(IVMRImagePresenter *iface,
+         }
+     }
+ 
+-    GetClientRect(presenter->window, &rect);
+-    point.x = point.y = 0;
+-    ClientToScreen(presenter->window, &point);
+-    OffsetRect(&rect, point.x, point.y);
+-    if (FAILED(hr = IDirectDrawSurface7_Blt(presenter->primary, &rect, info->lpSurf, NULL, DDBLT_WAIT, NULL)))
+-        ERR("Failed to blit, hr %#lx.\n", hr);
++    ERR("Failed to blit, hr %#lx.\n", hr);
+ 
+     return S_OK;
+ }
+-- 
+2.51.0
+

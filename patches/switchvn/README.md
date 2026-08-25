@@ -25,3 +25,6 @@ filename order.
 - `0029-wmp-use-logarithmic-volume-scaling.patch`:
   Convert WMP's 0--100 volume level to DirectShow's logarithmic decibel scale
   so normal application volume levels remain audible.
+- `0030-quartz-prefer-directdraw-blit-for-vmr7-yuv.patch`:
+  Present VMR7's already converted RGB32 video surface through DirectDraw and
+  retain `StretchDIBits` only as a compatibility fallback.
