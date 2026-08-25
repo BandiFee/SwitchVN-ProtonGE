@@ -348,7 +348,8 @@ apply_all_in_dir() {
             || ! grep -Fq "!format->bmiHeader.biWidth || !format->bmiHeader.biHeight" dlls/winedmo/quartz_transform.c \
             || ! grep -Fq "mpeg1_wave_format_from_codec_params" dlls/winedmo/unix_media_type.c \
             || ! grep -Fq "CLSID_MSH265DecoderMFT" dlls/msmpeg2vdec/msmpeg2vdec.c \
-            || ! grep -Fq "wmp_attach_video_window" dlls/wmp/player.c; then
+            || ! grep -Fq "wmp_attach_video_window" dlls/wmp/player.c \
+            || ! grep -Fq "IID_IWMPPlayer2_compat" dlls/wmp/oleobj.c; then
         echo "FAILED: SwitchVN media compatibility patch sentinel is missing" >&2
         exit 1
     fi

@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Tue, 25 Aug 2026 00:00:00 +0800
+Subject: [PATCH] wmp: support the IWMPPlayer2 compatibility interface
+
+AxInterop.WMPLib queries IWMPPlayer2 while attaching the Windows Media Player
+ActiveX control. Wine exposes IWMPPlayer and IWMPPlayer4, but the missing
+IWMPPlayer2 IID makes AxHost dispose the control before the media URL is set.
+
+Expose IWMPPlayer2 through the ABI-compatible IWMPPlayer interface and extend
+its vtable with the stretchToFit and windowlessVideo methods introduced by
+IWMPPlayer2. Add coverage for both the interface query and extended vtable.
+---
+
+diff --git a/dlls/wmp/oleobj.c b/dlls/wmp/oleobj.c
+index 628130783b8..4678ee27e39 100644
+--- a/dlls/wmp/oleobj.c
++++ b/dlls/wmp/oleobj.c
+@@ -23,6 +23,12 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wmp);
+ 
++/* IWMPPlayer2 is present in the Windows Media Player type library but is not
++ * declared by Wine's wmp.idl yet.  AxInterop.WMPLib uses it when attaching the
++ * ActiveX control, so expose the ABI-compatible IWMPPlayer interface for it. */
++static const GUID IID_IWMPPlayer2_compat =
++    {0x0e6b01d1, 0xd407, 0x4c85, {0xbf, 0x5f, 0x1c, 0x01, 0xf6, 0x15, 0x02, 0x80}};
++
+ static HWND get_container_hwnd(WindowsMediaPlayer *This)
+ {
+     IOleWindow *ole_window;
+@@ -264,6 +270,9 @@ static HRESULT WINAPI OleObject_QueryInterface(IOleObject *iface, REFIID riid, v
+     }else if(IsEqualGUID(riid, &IID_IWMPPlayer)) {
+         TRACE("(%p)->(IID_IWMPPlayer %p)\n", This, ppv);
+         *ppv = &This->IWMPPlayer_iface;
++    }else if(IsEqualGUID(riid, &IID_IWMPPlayer2_compat)) {
++        TRACE("(%p)->(IID_IWMPPlayer2 %p)\n", This, ppv);
++        *ppv = &This->IWMPPlayer_iface;
+     }else if(IsEqualGUID(riid, &IID_IWMPSettings)) {
+         TRACE("(%p)->(IID_IWMPSettings %p)\n", This, ppv);
+         *ppv = &This->IWMPSettings_iface;
+diff --git a/dlls/wmp/player.c b/dlls/wmp/player.c
+index 583f5847907..ccdb004b4cd 100644
+--- a/dlls/wmp/player.c
++++ b/dlls/wmp/player.c
+@@ -695,7 +695,40 @@ static HRESULT WINAPI WMPPlayer_get_uiMode(IWMPPlayer *iface, BSTR *pbstrMode)
+     return WMPPlayer4_get_uiMode(&This->IWMPPlayer4_iface, pbstrMode);
+ }
+ 
+-static IWMPPlayerVtbl WMPPlayerVtbl = {
++static HRESULT WINAPI WMPPlayer2_get_stretchToFit(IWMPPlayer *iface, VARIANT_BOOL *enabled)
++{
++    WindowsMediaPlayer *This = impl_from_IWMPPlayer(iface);
++    return WMPPlayer4_get_stretchToFit(&This->IWMPPlayer4_iface, enabled);
++}
++
++static HRESULT WINAPI WMPPlayer2_put_stretchToFit(IWMPPlayer *iface, VARIANT_BOOL enabled)
++{
++    WindowsMediaPlayer *This = impl_from_IWMPPlayer(iface);
++    return WMPPlayer4_put_stretchToFit(&This->IWMPPlayer4_iface, enabled);
++}
++
++static HRESULT WINAPI WMPPlayer2_get_windowlessVideo(IWMPPlayer *iface, VARIANT_BOOL *enabled)
++{
++    WindowsMediaPlayer *This = impl_from_IWMPPlayer(iface);
++    return WMPPlayer4_get_windowlessVideo(&This->IWMPPlayer4_iface, enabled);
++}
++
++static HRESULT WINAPI WMPPlayer2_put_windowlessVideo(IWMPPlayer *iface, VARIANT_BOOL enabled)
++{
++    WindowsMediaPlayer *This = impl_from_IWMPPlayer(iface);
++    return WMPPlayer4_put_windowlessVideo(&This->IWMPPlayer4_iface, enabled);
++}
++
++struct IWMPPlayer2CompatVtbl
++{
++    IWMPPlayerVtbl base;
++    HRESULT (WINAPI *get_stretchToFit)(IWMPPlayer *iface, VARIANT_BOOL *enabled);
++    HRESULT (WINAPI *put_stretchToFit)(IWMPPlayer *iface, VARIANT_BOOL enabled);
++    HRESULT (WINAPI *get_windowlessVideo)(IWMPPlayer *iface, VARIANT_BOOL *enabled);
++    HRESULT (WINAPI *put_windowlessVideo)(IWMPPlayer *iface, VARIANT_BOOL enabled);
++};
++
++static const struct IWMPPlayer2CompatVtbl WMPPlayer2CompatVtbl = {{
+     WMPPlayer_QueryInterface,
+     WMPPlayer_AddRef,
+     WMPPlayer_Release,
+@@ -732,6 +765,11 @@ static IWMPPlayerVtbl WMPPlayerVtbl = {
+     WMPPlayer_put_enableContextMenu,
+     WMPPlayer_put_uiMode,
+     WMPPlayer_get_uiMode,
++},
++    WMPPlayer2_get_stretchToFit,
++    WMPPlayer2_put_stretchToFit,
++    WMPPlayer2_get_windowlessVideo,
++    WMPPlayer2_put_windowlessVideo,
+ };
+ 
+ 
+@@ -2259,7 +2297,7 @@ BOOL init_player(WindowsMediaPlayer *wmp)
+     }
+ 
+     wmp->IWMPPlayer4_iface.lpVtbl = &WMPPlayer4Vtbl;
+-    wmp->IWMPPlayer_iface.lpVtbl = &WMPPlayerVtbl;
++    wmp->IWMPPlayer_iface.lpVtbl = &WMPPlayer2CompatVtbl.base;
+     wmp->IWMPSettings_iface.lpVtbl = &WMPSettingsVtbl;
+     wmp->IWMPControls_iface.lpVtbl = &WMPControlsVtbl;
+     wmp->IWMPNetwork_iface.lpVtbl = &WMPNetworkVtbl;
+diff --git a/dlls/wmp/tests/oleobj.c b/dlls/wmp/tests/oleobj.c
+index 614434e7c1b..09bfdacec7f 100644
+--- a/dlls/wmp/tests/oleobj.c
++++ b/dlls/wmp/tests/oleobj.c
+@@ -888,8 +888,24 @@ static void test_ConnectionPoint(IOleObject *unk)
+     IConnectionPoint_Release(point);
+ }
+ 
++struct iwmpplayer2_compat_vtbl
++{
++    IWMPPlayerVtbl base;
++    HRESULT (WINAPI *get_stretchToFit)(IWMPPlayer *iface, VARIANT_BOOL *enabled);
++    HRESULT (WINAPI *put_stretchToFit)(IWMPPlayer *iface, VARIANT_BOOL enabled);
++    HRESULT (WINAPI *get_windowlessVideo)(IWMPPlayer *iface, VARIANT_BOOL *enabled);
++    HRESULT (WINAPI *put_windowlessVideo)(IWMPPlayer *iface, VARIANT_BOOL enabled);
++};
++
++struct iwmpplayer2_compat
++{
++    const struct iwmpplayer2_compat_vtbl *lpVtbl;
++};
++
+ static void test_wmp_ifaces(IOleObject *oleobj)
+ {
++    static const GUID IID_IWMPPlayer2_compat =
++        {0x0e6b01d1, 0xd407, 0x4c85, {0xbf, 0x5f, 0x1c, 0x01, 0xf6, 0x15, 0x02, 0x80}};
+     IWMPSettings *settings, *settings_qi;
+     IWMPPlayer4 *player4;
+     IWMPPlayer *player;
+@@ -898,6 +914,7 @@ static void test_wmp_ifaces(IOleObject *oleobj)
+     IWMPControls *controls;
+     VARIANT_BOOL vbool;
+     IWMPNetwork *network;
++    struct iwmpplayer2_compat *player2;
+     IUnknown *unk;
+     HRESULT hres;
+     BSTR filename;
+@@ -906,6 +923,18 @@ static void test_wmp_ifaces(IOleObject *oleobj)
+     hres = IOleObject_QueryInterface(oleobj, &IID_IWMPPlayer4, (void**)&player4);
+     ok(hres == S_OK, "Could not get IWMPPlayer4 iface: %08lx\n", hres);
+ 
++    player2 = NULL;
++    hres = IOleObject_QueryInterface(oleobj, &IID_IWMPPlayer2_compat, (void **)&player2);
++    ok(hres == S_OK, "Could not get IWMPPlayer2 iface: %08lx\n", hres);
++    ok(player2 != NULL, "IWMPPlayer2 interface is NULL\n");
++    hres = player2->lpVtbl->put_stretchToFit((IWMPPlayer *)player2, VARIANT_TRUE);
++    ok(hres == S_OK, "IWMPPlayer2 put_stretchToFit failed: %08lx\n", hres);
++    vbool = VARIANT_FALSE;
++    hres = player2->lpVtbl->get_stretchToFit((IWMPPlayer *)player2, &vbool);
++    ok(hres == S_OK, "IWMPPlayer2 get_stretchToFit failed: %08lx\n", hres);
++    ok(vbool == VARIANT_TRUE, "stretchToFit is %d\n", vbool);
++    IUnknown_Release((IUnknown *)player2);
++
+     controls = NULL;
+     hres = IWMPPlayer4_get_controls(player4, &controls);
+     ok(hres == S_OK, "get_controls failed: %08lx\n", hres);
+-- 
+2.51.0

@@ -18,3 +18,6 @@ filename order.
 - `0027-wmp-embed-directshow-video-window.patch`:
   Balanced WMP ActiveX in-place activation lifetime and embedded DirectShow
   video-window ownership, sizing, visibility, and cleanup.
+- `0028-wmp-support-iwmpplayer2.patch`:
+  `IWMPPlayer2` ActiveX compatibility for AxInterop.WMPLib, including the
+  extended stretch-to-fit and windowless-video vtable slots.
