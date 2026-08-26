@@ -38,3 +38,6 @@ filename order.
   Tear down video renderer windows asynchronously when the final filter release
   runs outside the window thread, avoiding a deadlock when that thread is no
   longer pumping messages during an early video exit.
+- `0034-winedmo-fix-wow64-demuxer-destroy-params.patch`:
+  Pass the correct parameter layout through the WoW64 demuxer destroy thunk so
+  32-bit games release ASF demuxers instead of dereferencing a null handle.

@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 26 Aug 2026 00:00:04 +0800
+Subject: [PATCH] winedmo: fix WoW64 demuxer destroy parameters
+
+wow64_demuxer_destroy() allocated demuxer_create_params before passing it to
+demuxer_destroy(). The create structure stores the demuxer after two pointers,
+while the destroy structure stores it at offset zero, so the Unix side read an
+uninitialized handle and dereferenced a null demuxer during graph teardown.
+
+Use the matching destroy parameter structure so the native demuxer and its
+stream context are released correctly when a 32-bit game closes an ASF graph.
+---
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index 29dfba72c90..c362690b917 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -225,7 +225,7 @@ static NTSTATUS wow64_demuxer_destroy( void *arg )
+         struct winedmo_demuxer demuxer;
+         PTR32 context;
+     } *params32 = arg;
+-    struct demuxer_create_params params;
++    struct demuxer_destroy_params params;
+     NTSTATUS status;
+ 
+     params.demuxer = params32->demuxer;
+
+-- 
+2.54.0
