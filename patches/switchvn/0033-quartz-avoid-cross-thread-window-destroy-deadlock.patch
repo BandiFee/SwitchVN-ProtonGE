@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwitchVN <switchvn@example.com>
+Date: Wed, 26 Aug 2026 00:00:03 +0800
+Subject: [PATCH] quartz: avoid cross-thread video window teardown deadlock
+
+A video renderer window belongs to the thread which created the filter, but
+the final filter Release() may run on another thread. video_window_cleanup()
+used SendMessage() unconditionally, so graph teardown blocked forever when
+the creating thread was no longer pumping messages. This happens when
+SiglusEngine skips a WMV video.
+
+Handle same-thread destruction synchronously. For cross-thread destruction,
+detach the window from the filter object and post the private destruction
+message instead. Handle that message without dereferencing the detached
+object so the filter may be freed as soon as teardown returns.
+
+Add a VMR7 regression test which creates the renderer on a thread that does
+not pump messages and releases it from a different thread.
+---
+diff --git a/dlls/quartz/tests/vmr7.c b/dlls/quartz/tests/vmr7.c
+index 94e843b3352..be5b738aefd 100644
+--- a/dlls/quartz/tests/vmr7.c
++++ b/dlls/quartz/tests/vmr7.c
+@@ -1648,6 +1648,114 @@ static void test_overlay(void)
+     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+ }
+ 
++struct cross_thread_destroy_params
++{
++    HANDLE ready_event;
++    HANDLE dispatch_event;
++    IBaseFilter *filter;
++    HWND hwnd;
++    HRESULT hr;
++    ULONG refcount;
++    BOOL destroyed;
++};
++
++static DWORD WINAPI window_owner_thread(void *arg)
++{
++    struct cross_thread_destroy_params *params = arg;
++    IOverlay *overlay = NULL;
++    IPin *pin = NULL;
++    MSG msg;
++
++    CoInitialize(NULL);
++
++    params->hr = CoCreateInstance(&CLSID_VideoMixingRenderer, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&params->filter);
++    if (SUCCEEDED(params->hr))
++        params->hr = IBaseFilter_FindPin(params->filter, L"VMR Input0", &pin);
++    if (SUCCEEDED(params->hr))
++        params->hr = IPin_QueryInterface(pin, &IID_IOverlay, (void **)&overlay);
++    if (SUCCEEDED(params->hr))
++        params->hr = IOverlay_GetWindowHandle(overlay, &params->hwnd);
++
++    if (overlay)
++        IOverlay_Release(overlay);
++    if (pin)
++        IPin_Release(pin);
++
++    SetEvent(params->ready_event);
++
++    if (SUCCEEDED(params->hr))
++    {
++        WaitForSingleObject(params->dispatch_event, INFINITE);
++        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
++            DispatchMessageW(&msg);
++        params->destroyed = !IsWindow(params->hwnd);
++    }
++    else if (params->filter)
++    {
++        IBaseFilter_Release(params->filter);
++        params->filter = NULL;
++    }
++
++    CoUninitialize();
++    return 0;
++}
++
++static DWORD WINAPI release_filter_thread(void *arg)
++{
++    struct cross_thread_destroy_params *params = arg;
++
++    params->refcount = IBaseFilter_Release(params->filter);
++    return 0;
++}
++
++static void test_cross_thread_destroy(void)
++{
++    struct cross_thread_destroy_params params = {0};
++    HANDLE owner_thread, release_thread;
++    DWORD ret;
++
++    params.ready_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    params.dispatch_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    ok(!!params.ready_event, "Failed to create ready event, error %lu.\n", GetLastError());
++    ok(!!params.dispatch_event, "Failed to create dispatch event, error %lu.\n", GetLastError());
++
++    owner_thread = CreateThread(NULL, 0, window_owner_thread, &params, 0, NULL);
++    ok(!!owner_thread, "Failed to create window owner thread, error %lu.\n", GetLastError());
++    ret = WaitForSingleObject(params.ready_event, 1000);
++    ok(ret == WAIT_OBJECT_0, "Window owner thread did not become ready, ret %#lx.\n", ret);
++    if (ret != WAIT_OBJECT_0 || FAILED(params.hr))
++    {
++        ok(SUCCEEDED(params.hr), "Failed to create VMR, hr %#lx.\n", params.hr);
++        if (owner_thread)
++            WaitForSingleObject(owner_thread, 1000);
++        goto done;
++    }
++
++    ok(GetWindowThreadProcessId(params.hwnd, NULL) != GetCurrentThreadId(),
++            "Expected a window owned by another thread.\n");
++
++    release_thread = CreateThread(NULL, 0, release_filter_thread, &params, 0, NULL);
++    ok(!!release_thread, "Failed to create release thread, error %lu.\n", GetLastError());
++    ret = WaitForSingleObject(release_thread, 1000);
++    ok(ret == WAIT_OBJECT_0, "Filter release blocked waiting for the window thread.\n");
++
++    SetEvent(params.dispatch_event);
++    ok(WaitForSingleObject(owner_thread, 1000) == WAIT_OBJECT_0,
++            "Window owner thread failed to exit.\n");
++    if (ret != WAIT_OBJECT_0)
++        WaitForSingleObject(release_thread, 1000);
++
++    ok(!params.refcount, "Got outstanding refcount %lu.\n", params.refcount);
++    ok(params.destroyed, "Window %p was not destroyed.\n", params.hwnd);
++    CloseHandle(release_thread);
++    CloseHandle(owner_thread);
++
++done:
++    CloseHandle(params.dispatch_event);
++    CloseHandle(params.ready_event);
++}
++
+ /* try to make sure pending X events have been processed before continuing */
+ static void flush_events(void)
+ {
+@@ -4029,6 +4137,7 @@ START_TEST(vmr7)
+     test_unconnected_filter_state();
+     test_connect_pin();
+     test_overlay();
++    test_cross_thread_destroy();
+     test_video_window();
+     test_basic_video();
+     test_windowless_size();
+diff --git a/dlls/quartz/window.c b/dlls/quartz/window.c
+index 1fcd45372cf..d1083e447d7 100644
+--- a/dlls/quartz/window.c
++++ b/dlls/quartz/window.c
+@@ -33,7 +33,22 @@ static inline struct video_window *impl_from_IVideoWindow(IVideoWindow *iface)
+ 
+ static LRESULT CALLBACK WndProcW(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+ {
+-    struct video_window *window = (struct video_window *)GetWindowLongPtrW(hwnd, 0);
++    struct video_window *window;
++
++    /* This message may be posted after the filter object has been released,
++     * so handle it before looking up the window's owner. */
++    if (message == WM_QUARTZ_DESTROY)
++    {
++        /* Media Player Classic deadlocks if WM_PARENTNOTIFY is sent, so clear
++         * the child style first. Just like Windows, we don't actually unparent
++         * the window, to prevent extra focus events from being generated since
++         * it would become top-level for a brief period before being destroyed. */
++        SetWindowLongW(hwnd, GWL_STYLE, GetWindowLongW(hwnd, GWL_STYLE) & ~WS_CHILD);
++        DestroyWindow(hwnd);
++        return 0;
++    }
++
++    window = (struct video_window *)GetWindowLongPtrW(hwnd, 0);
+ 
+     if (!window)
+         return DefWindowProcW(hwnd, message, wparam, lparam);
+@@ -73,9 +88,6 @@ static LRESULT CALLBACK WndProcW(HWND hwnd, UINT message, WPARAM wparam, LPARAM
+         if (window->default_dst)
+             GetClientRect(window->hwnd, &window->dst);
+         break;
+-    case WM_QUARTZ_DESTROY:
+-        DestroyWindow(hwnd);
+-        return 0;
+     case WM_CLOSE:
+     {
+         IFilterGraph *graph = window->pFilter->graph;
+@@ -1310,13 +1322,24 @@ void video_window_cleanup(struct video_window *window)
+ {
+     if (window->hwnd)
+     {
+-        /* Media Player Classic deadlocks if WM_PARENTNOTIFY is sent, so clear
+-         * the child style first. Just like Windows, we don't actually unparent
+-         * the window, to prevent extra focus events from being generated since
+-         * it would become top-level for a brief period before being destroyed. */
+-        SetWindowLongW(window->hwnd, GWL_STYLE, GetWindowLongW(window->hwnd, GWL_STYLE) & ~WS_CHILD);
++        HWND hwnd = window->hwnd;
+ 
+-        SendMessageW(window->hwnd, WM_QUARTZ_DESTROY, 0, 0);
+         window->hwnd = NULL;
++
++        if (GetWindowThreadProcessId(hwnd, NULL) == GetCurrentThreadId())
++        {
++            SendMessageW(hwnd, WM_QUARTZ_DESTROY, 0, 0);
++        }
++        else
++        {
++            /* SendMessage() waits for the window thread to dispatch the
++             * message. Some applications release the filter from another
++             * thread while the creating thread is no longer pumping messages,
++             * which would deadlock graph teardown. Detach the object pointer
++             * before posting so the filter can be safely freed immediately. */
++            SetWindowLongPtrW(hwnd, 0, 0);
++            if (!PostMessageW(hwnd, WM_QUARTZ_DESTROY, 0, 0))
++                WARN("Failed to post window destruction message, error %lu.\n", GetLastError());
++        }
+     }
+ }
+
+-- 
+2.54.0
+

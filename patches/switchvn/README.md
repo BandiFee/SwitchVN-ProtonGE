@@ -34,3 +34,7 @@ filename order.
 - `0032-quartz-add-sse2-ssse3-vmr7-yuv-conversion.patch`:
   Convert VMR7 NV12 and YV12 frames eight pixels at a time with SSE2, using
   SSSE3 shuffles for interleaved NV12 chroma and scalar code for edge fallback.
+- `0033-quartz-avoid-cross-thread-window-destroy-deadlock.patch`:
+  Tear down video renderer windows asynchronously when the final filter release
+  runs outside the window thread, avoiding a deadlock when that thread is no
+  longer pumping messages during an early video exit.
