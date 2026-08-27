@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: SwitchVN <switchvn@example.com>
 Date: Wed, 26 Aug 2026 00:00:03 +0800
-Subject: [PATCH] quartz: avoid cross-thread video window teardown deadlock
+Subject: [PATCH] quartz: avoid cross-thread video window teardown deadlocks
 
 A video renderer window belongs to the thread which created the filter, but
 the final filter Release() may run on another thread. video_window_cleanup()
@@ -14,9 +14,177 @@ detach the window from the filter object and post the private destruction
 message instead. Handle that message without dereferencing the detached
 object so the filter may be freed as soon as teardown returns.
 
-Add a VMR7 regression test which creates the renderer on a thread that does
-not pump messages and releases it from a different thread.
+Asynchronous window destruction can expose the reverse dependency when the
+last threaded graph is released: the releasing thread waits for the graph
+worker while the worker destroys a child window and synchronously sends to
+its parent on the releasing thread. Detach the exiting worker from the global
+slot, then wait while dispatching sent messages so the child can be destroyed
+without dispatching unrelated posted messages or blocking reentrant graph
+creation behind a worker which is already exiting.
+
+Add regression tests for both a renderer created on a non-pumping owner thread
+and a threaded graph worker which sends to the releasing thread while its
+child window is destroyed.
 ---
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -69,6 +69,26 @@ static HANDLE message_thread, message_thread_ret;
+ static DWORD message_thread_id;
+ static unsigned int message_thread_refcount;
+ 
++static DWORD wait_for_message_thread(HANDLE thread)
++{
++    DWORD ret;
++
++    /* A filter created on the graph worker may own a child window. Destroying
++     * that window while the worker exits can synchronously send messages to
++     * its parent on this thread. A plain wait would deadlock both threads. */
++    while ((ret = MsgWaitForMultipleObjectsEx(1, &thread, INFINITE,
++            QS_SENDMESSAGE, 0)) == WAIT_OBJECT_0 + 1)
++    {
++        MSG msg;
++
++        /* PeekMessage() dispatches pending sent messages before it returns.
++         * Do not remove posted messages and introduce arbitrary reentrancy. */
++        PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);
++    }
++
++    return ret;
++}
++
+ struct media_event
+ {
+     struct list entry;
+@@ -478,6 +498,8 @@ static ULONG WINAPI FilterGraphInner_Release(IUnknown *iface)
+ 
+     if (!refcount)
+     {
++        HANDLE shutdown_thread = NULL, shutdown_event = NULL;
++        DWORD shutdown_thread_id = 0;
+         int i;
+ 
+         This->ref = 1; /* guard against reentrancy (aggregation). */
+@@ -510,13 +532,33 @@ static ULONG WINAPI FilterGraphInner_Release(IUnknown *iface)
+         EnterCriticalSection(&message_cs);
+         if (This->threaded && !--message_thread_refcount)
+         {
+-            PostThreadMessageW(message_thread_id, WM_USER + 1, 0, 0);
+-            WaitForSingleObject(message_thread, INFINITE);
+-            CloseHandle(message_thread);
+-            CloseHandle(message_thread_ret);
++            shutdown_thread = message_thread;
++            shutdown_event = message_thread_ret;
++            shutdown_thread_id = message_thread_id;
++
++            /* Detach the exiting worker before pumping sent messages below.
++             * A sent window message may re-enter Quartz and create a new graph,
++             * which must get a new worker rather than queue work behind the old
++             * worker's exit message. */
++            message_thread = NULL;
++            message_thread_ret = NULL;
++            message_thread_id = 0;
++
++            if (!PostThreadMessageW(shutdown_thread_id, WM_USER + 1, 0, 0))
++                WARN("Failed to post graph worker shutdown message, error %lu.\n", GetLastError());
+         }
+         LeaveCriticalSection(&message_cs);
+ 
++        if (shutdown_thread)
++        {
++            DWORD ret = wait_for_message_thread(shutdown_thread);
++
++            if (ret != WAIT_OBJECT_0)
++                WARN("Failed to wait for graph worker, ret %#lx, error %lu.\n", ret, GetLastError());
++            CloseHandle(shutdown_thread);
++            CloseHandle(shutdown_event);
++        }
++
+         This->event_cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->event_cs);
+         This->cs.DebugInfo->Spare[0] = 0;
+diff --git a/dlls/quartz/tests/filtergraph.c b/dlls/quartz/tests/filtergraph.c
+--- a/dlls/quartz/tests/filtergraph.c
++++ b/dlls/quartz/tests/filtergraph.c
+@@ -5495,14 +5495,40 @@ static HWND get_renderer_hwnd(IFilterGraph2 *graph)
+     return hwnd;
+ }
+ 
++#define WM_GRAPH_WORKER_DESTROY (WM_APP + 0x123)
++
+ static BOOL expect_parent_message = TRUE;
++static HWND graph_worker_parent;
++static WNDPROC graph_worker_window_proc;
++static LONG graph_worker_message_received;
++static LONG graph_worker_message_sent;
+ 
+ static LRESULT CALLBACK parent_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+ {
++    if (msg == WM_GRAPH_WORKER_DESTROY)
++    {
++        InterlockedExchange(&graph_worker_message_received, TRUE);
++        return 0x1234;
++    }
++
+     ok(expect_parent_message, "Got unexpected message %#x.\n", msg);
+     return DefWindowProcA(hwnd, msg, wparam, lparam);
+ }
+ 
++static LRESULT CALLBACK graph_worker_window_destroy_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    if (msg == WM_DESTROY)
++    {
++        DWORD_PTR result;
++
++        if (SendMessageTimeoutW(graph_worker_parent, WM_GRAPH_WORKER_DESTROY, 0, 0,
++                SMTO_BLOCK, 2000, &result))
++            InterlockedExchange(&graph_worker_message_sent, TRUE);
++    }
++
++    return CallWindowProcW(graph_worker_window_proc, hwnd, msg, wparam, lparam);
++}
++
+ static void test_window_threading(void)
+ {
+     static const WNDCLASSA class =
+@@ -5518,7 +5544,7 @@ static void test_window_threading(void)
+     DWORD tid, tid2;
+     HRESULT hr;
+     ULONG ref;
+-    BOOL ret;
++    BOOL ret, test_worker_shutdown = FALSE;
+ 
+     RegisterClassA(&class);
+ 
+@@ -5564,6 +5590,14 @@ static void test_window_threading(void)
+ 
+         ref = IFilterGraph2_Release(graph2);
+         ok(!ref, "Got outstanding refcount %ld.\n", ref);
++
++        graph_worker_parent = parent;
++        graph_worker_message_received = FALSE;
++        graph_worker_message_sent = FALSE;
++        graph_worker_window_proc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
++                (LONG_PTR)graph_worker_window_destroy_proc);
++        ok(!!graph_worker_window_proc, "Failed to subclass renderer window, error %lu.\n", GetLastError());
++        test_worker_shutdown = !!graph_worker_window_proc;
+     }
+     else
+         skip("Could not find renderer window.\n");
+@@ -5574,6 +5608,13 @@ static void test_window_threading(void)
+     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+     expect_parent_message = TRUE;
+ 
++    if (test_worker_shutdown)
++    {
++        ok(graph_worker_message_sent, "Graph worker timed out sending to the releasing thread.\n");
++        ok(graph_worker_message_received, "Releasing thread did not dispatch the graph worker message.\n");
++    }
++    graph_worker_parent = NULL;
++
+     hwnd = GetActiveWindow();
+     ok(hwnd == parent, "Parent window lost focus, active window %p.\n", hwnd);
+ 
 diff --git a/dlls/quartz/tests/vmr7.c b/dlls/quartz/tests/vmr7.c
 index 94e843b3352..be5b738aefd 100644
 --- a/dlls/quartz/tests/vmr7.c
@@ -216,4 +384,3 @@ index 1fcd45372cf..d1083e447d7 100644
 
 -- 
 2.54.0
-
